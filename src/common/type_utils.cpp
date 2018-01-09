@@ -196,6 +196,12 @@ bool operator==(const URL& left, const URL& right)
 }
 
 
+bool operator==(const UUID& left, const UUID& right)
+{
+  return left.value() == right.value();
+}
+
+
 bool operator==(
     const ContainerInfo::DockerInfo::PortMapping& left,
     const ContainerInfo::DockerInfo::PortMapping& right)
@@ -401,6 +407,14 @@ bool operator==(const MasterInfo& left, const MasterInfo& right)
 
 
 bool operator==(
+    const ResourceProviderInfo::Storage& left,
+    const ResourceProviderInfo::Storage& right)
+{
+  return left.plugin() == right.plugin();
+}
+
+
+bool operator==(
     const ResourceProviderInfo& left,
     const ResourceProviderInfo& right)
 {
@@ -422,6 +436,51 @@ bool operator==(
     left.name() == right.name() &&
     left.has_storage() == right.has_storage() &&
     (!left.has_storage() || left.storage() == right.storage());
+}
+
+
+bool operator==(const OperationStatus& left, const OperationStatus& right)
+{
+  if (left.has_operation_id() != right.has_operation_id()) {
+    return false;
+  }
+
+  if (left.has_operation_id() && left.operation_id() != right.operation_id()) {
+    return false;
+  }
+
+  if (left.state() != right.state()) {
+    return false;
+  }
+
+  if (left.has_message() != right.has_message()) {
+    return false;
+  }
+
+  if (left.has_message() && left.message() != right.message()) {
+    return false;
+  }
+
+  if (Resources(left.converted_resources()) !=
+      Resources(right.converted_resources())) {
+    return false;
+  }
+
+  if (left.has_uuid() != right.has_uuid()) {
+    return false;
+  }
+
+  if (left.has_uuid() && left.uuid() != right.uuid()) {
+    return false;
+  }
+
+  return true;
+}
+
+
+bool operator!=(const OperationStatus& left, const OperationStatus& right)
+{
+  return !(left == right);
 }
 
 
@@ -650,15 +709,15 @@ ostream& operator<<(ostream& stream, const OfferID& offerId)
 }
 
 
-ostream& operator<<(ostream& stream, const OfferOperationID& offerOperationId)
+ostream& operator<<(ostream& stream, const OperationID& operationId)
 {
-  return stream << offerOperationId.value();
+  return stream << operationId.value();
 }
 
 
-ostream& operator<<(ostream& stream, const OfferOperationState& state)
+ostream& operator<<(ostream& stream, const OperationState& state)
 {
-  return stream << OfferOperationState_Name(state);
+  return stream << OperationState_Name(state);
 }
 
 
@@ -732,6 +791,17 @@ ostream& operator<<(ostream& stream, const TaskInfo& task)
 ostream& operator<<(ostream& stream, const TaskState& state)
 {
   return stream << TaskState_Name(state);
+}
+
+
+ostream& operator<<(ostream& stream, const UUID& uuid)
+{
+  Try<id::UUID> _uuid = id::UUID::fromBytes(uuid.value());
+  if (_uuid.isError()) {
+    return stream << "INVALID UUID";
+  }
+
+  return stream << _uuid->toString();
 }
 
 

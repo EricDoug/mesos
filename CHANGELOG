@@ -2,6 +2,27 @@ Release Notes - Mesos - Version 1.5.0 (WIP)
 -------------------------------------------
 This release contains the following new features:
 
+  * [MESOS-1739] - Agents now support the `--reconfiguration_policy`
+    flag which allows them to recover the agent ID and running tasks
+    after configuration changes. See docs/agent-recovery.md for more
+    details.
+  * [MESOS-7973] - Non-leading replica is now allowed to catch-up
+    missing log positions in the replicated log. This opens the door
+    for implementing hot standby (by offloading some reading from a
+    leader to standbys) and fast failover time (by keeping in-memory
+    storage represented by the log “hot”).
+  * Several improvements and fixes to the enforcement of quota
+    guarantees have been made: MESOS-4527, MESOS-7099, MESOS-8293,
+    MESOS-8339, MESOS-8352.
+  * [MESOS-7302] - Support launching standalone containers on the
+    agent using MesosContainerizer without a master or framework
+    running.
+  * [MESOS-7289, MESOS-7235] - **Experimental* support for Container
+    Storage Interface (CSI) to simplify storage management in Mesos,
+    and allow 3rdparty vendors to plugin into Mesos very easily.
+  * [MESOS-4945] Agents now can automatically garbage collect unused
+    Docker image layers used by MesosContainerizer.
+
 Deprecations/Removals:
   * Agent flag `--executor_secret_key` has been deprecated. Operators
     should use `--jwt_secret_key` instead.
@@ -17,6 +38,10 @@ Additional API Changes:
   * [MESOS-7550] The fields `Resource.disk.source.path.root` and
     `Resource.disk.source.mount.root` can now be set to relative paths
     to an agent's work directory.
+  * [MESOS-8040] Return nested/standalone containers in `GET_CONTAINERS`
+    API call.
+  * [MESOS-7973] A new `catchup` method has been added to the
+    `Log.Reader` interface (including Java binding).
 
 Unresolved Critical Issues:
 
@@ -27,12 +52,15 @@ Feature Graduations:
 All Experimental Features:
 
 
-Release Notes - Mesos - Version 1.4.2
+Release Notes - Mesos - Version 1.4.2 (WIP)
 -------------------------------------------
 * This is a bug fix release.
 
 ** Bug
+ * [MESOS-7975] - The command/default/docker executor can incorrectly send a TASK_FINISHED update even when the task is killed.
+ * [MESOS-8159] - ns::clone uses an async signal unsafe stack.
  * [MESOS-8237] - Strip (Offer|Resource).allocation_info for non-MULTI_ROLE schedulers.
+ * [MESOS-8297] - Built-in driver-based executors ignore kill task if the task has not been launched.
 
 
 Release Notes - Mesos - Version 1.4.1

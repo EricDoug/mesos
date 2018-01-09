@@ -16,6 +16,8 @@
 
 #include "master/registry_operations.hpp"
 
+#include "common/resources_utils.hpp"
+
 namespace mesos {
 namespace internal {
 namespace master {
@@ -36,10 +38,60 @@ Try<bool> AdmitSlave::perform(Registry* registry, hashset<SlaveID>* slaveIDs)
     return Error("Agent already admitted");
   }
 
+  // Convert the resource format back to `PRE_RESERVATION_REFINEMENT` so
+  // the data stored in the registry can be read by older master versions.
+  SlaveInfo _info(info);
+  convertResourceFormat(_info.mutable_resources(),
+      PRE_RESERVATION_REFINEMENT);
+
   Registry::Slave* slave = registry->mutable_slaves()->add_slaves();
-  slave->mutable_info()->CopyFrom(info);
-  slaveIDs->insert(info.id());
+  slave->mutable_info()->CopyFrom(_info);
+  slaveIDs->insert(_info.id());
   return true; // Mutation.
+}
+
+
+UpdateSlave::UpdateSlave(const SlaveInfo& _info) : info(_info)
+{
+  CHECK(info.has_id()) << "SlaveInfo is missing the 'id' field";
+}
+
+
+Try<bool> UpdateSlave::perform(Registry* registry, hashset<SlaveID>* slaveIDs)
+{
+  if (!slaveIDs->contains(info.id())) {
+    return Error("Agent not yet admitted.");
+  }
+
+  for (int i = 0; i < registry->slaves().slaves().size(); i++) {
+    Registry::Slave* slave = registry->mutable_slaves()->mutable_slaves(i);
+
+    if (slave->info().id() == info.id()) {
+      // The SlaveInfo in the registry is stored in the
+      // `PRE_RESERVATION_REFINEMENT` format, but the equality operator
+      // asserts that resources are in `POST_RESERVATION_REFINEMENT` format,
+      // so we have to upgrade before we can do the comparison.
+      SlaveInfo _previousInfo(slave->info());
+      convertResourceFormat(_previousInfo.mutable_resources(),
+          POST_RESERVATION_REFINEMENT);
+
+      if (info == _previousInfo) {
+        return false; // No mutation.
+      }
+
+      // Convert the resource format back to `PRE_RESERVATION_REFINEMENT` so
+      // the data stored in the registry can be read by older master versions.
+      SlaveInfo _info(info);
+      convertResourceFormat(_info.mutable_resources(),
+          PRE_RESERVATION_REFINEMENT);
+
+      slave->mutable_info()->CopyFrom(_info);
+      return true; // Mutation.
+    }
+  }
+
+  // Shouldn't happen
+  return Error("Failed to find agent " + stringify(info.id()));
 }
 
 
@@ -133,13 +185,19 @@ Try<bool> MarkSlaveReachable::perform(
     LOG(WARNING) << "Allowing UNKNOWN agent to reregister: " << info;
   }
 
+  // Convert the resource format back to `PRE_RESERVATION_REFINEMENT` so
+  // the data stored in the registry can be read by older master versions.
+  SlaveInfo _info(info);
+  convertResourceFormat(_info.mutable_resources(),
+    PRE_RESERVATION_REFINEMENT);
+
   // Add the slave to the admitted list, even if we didn't find it
   // in the unreachable list. This accounts for when the slave was
   // unreachable for a long time, was GC'd from the unreachable
   // list, but then eventually reregistered.
   Registry::Slave* slave = registry->mutable_slaves()->add_slaves();
-  slave->mutable_info()->CopyFrom(info);
-  slaveIDs->insert(info.id());
+  slave->mutable_info()->CopyFrom(_info);
+  slaveIDs->insert(_info.id());
 
   return true; // Mutation.
 }

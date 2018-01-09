@@ -655,8 +655,8 @@ protected:
         break;
       }
 
-      // TODO(greggomann): Implement handling of offer operation updates.
-      case Event::OFFER_OPERATION_UPDATE:
+      // TODO(greggomann): Implement handling of operation status updates.
+      case Event::UPDATE_OPERATION_STATUS:
         break;
 
       case Event::MESSAGE: {
@@ -1796,7 +1796,7 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(true),
     credential(nullptr),
-    schedulerId("scheduler-" + UUID::random().toString())
+    schedulerId("scheduler-" + id::UUID::random().toString())
 {
   initialize();
 }
@@ -1816,7 +1816,7 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(true),
     credential(new Credential(_credential)),
-    schedulerId("scheduler-" + UUID::random().toString())
+    schedulerId("scheduler-" + id::UUID::random().toString())
 {
   initialize();
 }
@@ -1836,7 +1836,7 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(_implicitAcknowlegements),
     credential(nullptr),
-    schedulerId("scheduler-" + UUID::random().toString())
+    schedulerId("scheduler-" + id::UUID::random().toString())
 {
   initialize();
 }
@@ -1857,7 +1857,7 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(_implicitAcknowlegements),
     credential(new Credential(_credential)),
-    schedulerId("scheduler-" + UUID::random().toString())
+    schedulerId("scheduler-" + id::UUID::random().toString())
 {
   initialize();
 }

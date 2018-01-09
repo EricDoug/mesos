@@ -761,7 +761,7 @@ TEST_F(HealthCheckTest, HealthyTaskNonShell)
 
 // This test creates a task whose health flaps, and verifies that the
 // health status updates are sent to the framework scheduler.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthStatusChange)
+TEST_F(HealthCheckTest, HealthStatusChange)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -1392,11 +1392,7 @@ TEST_F(HealthCheckTest, HealthyToUnhealthyTransitionWithinGracePeriod)
 
 
 // Tests a healthy non-contained task via HTTP.
-//
-// TODO(josephw): Enable this. Mesos builds its own `curl.exe`, since it
-// can't rely on a package manager to get it. We need to make this test use
-// that executable.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTP)
+TEST_F(HealthCheckTest, HealthyTaskViaHTTP)
 {
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1486,11 +1482,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTP)
 // with the difference being the health check type is not set.
 //
 // TODO(haosdent): Remove this after the deprecation cycle which starts in 2.0.
-//
-// TODO(josephw): Enable this. Mesos builds its own `curl.exe`, since it
-// can't rely on a package manager to get it. We need to make this test use
-// that executable.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTPWithoutType)
+TEST_F(HealthCheckTest, HealthyTaskViaHTTPWithoutType)
 {
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.allocation_interval = Milliseconds(50);
@@ -1825,7 +1817,7 @@ TEST_F(HealthCheckTest,
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   // Increase time here to wait for pulling image finish.
@@ -1949,13 +1941,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
-#ifndef USE_SSL_SOCKET
-  // Disable operator API authentication for the default executor. Executor
-  // authentication currently has SSL as a dependency, so we cannot require
-  // executors to authenticate with the agent operator API if Mesos was not
-  // built with SSL support.
-  flags.authenticate_http_readwrite = false;
 
+#ifndef USE_SSL_SOCKET
   // Set permissive ACLs in the agent so that the local authorizer will be
   // loaded and implicit executor authorization will be tested.
   ACLs acls;
@@ -2083,13 +2070,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
-#ifndef USE_SSL_SOCKET
-  // Disable operator API authentication for the default executor. Executor
-  // authentication currently has SSL as a dependency, so we cannot require
-  // executors to authenticate with the agent operator API if Mesos was not
-  // built with SSL support.
-  flags.authenticate_http_readwrite = false;
 
+#ifndef USE_SSL_SOCKET
   // Set permissive ACLs in the agent so that the local authorizer will be
   // loaded and implicit executor authorization will be tested.
   ACLs acls;
@@ -2482,7 +2464,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   AWAIT_READY(containerId);
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   // Increase time here to wait for pulling image finish.

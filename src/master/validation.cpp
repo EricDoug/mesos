@@ -264,23 +264,23 @@ static Option<Error> validateSlaveInfo(const SlaveInfo& slaveInfo)
 }
 
 
-Option<Error> registerSlave(
-    const SlaveInfo& slaveInfo,
-    const vector<Resource>& checkpointedResources)
+Option<Error> registerSlave(const RegisterSlaveMessage& message)
 {
+  const SlaveInfo& slaveInfo = message.slave();
+
   Option<Error> error = validateSlaveInfo(slaveInfo);
   if (error.isSome()) {
     return error.get();
   }
 
-  if (!checkpointedResources.empty()) {
+  if (!message.checkpointed_resources().empty()) {
     if (!slaveInfo.has_checkpoint() || !slaveInfo.checkpoint()) {
       return Error(
           "Checkpointed resources provided when checkpointing is not enabled");
     }
   }
 
-  foreach (const Resource& resource, checkpointedResources) {
+  foreach (const Resource& resource, message.checkpointed_resources()) {
     error = Resources::validate(resource);
     if (error.isSome()) {
       return error.get();
@@ -291,29 +291,25 @@ Option<Error> registerSlave(
 }
 
 
-Option<Error> reregisterSlave(
-    const SlaveInfo& slaveInfo,
-    const vector<Task>& tasks,
-    const vector<Resource>& resources,
-    const vector<ExecutorInfo>& executorInfos,
-    const vector<FrameworkInfo>& frameworkInfos)
+Option<Error> reregisterSlave(const ReregisterSlaveMessage& message)
 {
   hashset<FrameworkID> frameworkIDs;
   hashset<pair<FrameworkID, ExecutorID>> executorIDs;
 
+  const SlaveInfo& slaveInfo = message.slave();
   Option<Error> error = validateSlaveInfo(slaveInfo);
   if (error.isSome()) {
     return error.get();
   }
 
-  foreach (const Resource& resource, resources) {
+  foreach (const Resource& resource, message.checkpointed_resources()) {
     Option<Error> error = Resources::validate(resource);
     if (error.isSome()) {
       return error.get();
     }
   }
 
-  foreach (const FrameworkInfo& framework, frameworkInfos) {
+  foreach (const FrameworkInfo& framework, message.frameworks()) {
     Option<Error> error = validation::framework::validate(framework);
     if (error.isSome()) {
       return error.get();
@@ -327,7 +323,7 @@ Option<Error> reregisterSlave(
     frameworkIDs.insert(framework.id());
   }
 
-  foreach (const ExecutorInfo& executor, executorInfos) {
+  foreach (const ExecutorInfo& executor, message.executor_infos()) {
     Option<Error> error = validation::executor::validate(executor);
     if (error.isSome()) {
       return error.get();
@@ -362,7 +358,7 @@ Option<Error> reregisterSlave(
     }
   }
 
-  foreach (const Task& task, tasks) {
+  foreach (const Task& task, message.tasks()) {
     Option<Error> error = common::validation::validateTaskID(task.task_id());
     if (error.isSome()) {
       return Error("Task has an invalid TaskID: " + error->message);
@@ -588,21 +584,20 @@ Option<Error> validate(
         return Error("Expecting 'acknowledge' to be present");
       }
 
-      Try<UUID> uuid = UUID::fromBytes(call.acknowledge().uuid());
+      Try<id::UUID> uuid = id::UUID::fromBytes(call.acknowledge().uuid());
       if (uuid.isError()) {
         return uuid.error();
       }
       return None();
     }
 
-    case mesos::scheduler::Call::ACKNOWLEDGE_OFFER_OPERATION_UPDATE: {
-      if (!call.has_acknowledge_offer_operation_update()) {
-        return Error(
-            "Expecting 'acknowledge_offer_operation_update' to be present");
+    case mesos::scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS: {
+      if (!call.has_acknowledge_operation_status()) {
+        return Error("Expecting 'acknowledge_operation_status' to be present");
       }
 
-      Try<UUID> uuid = UUID::fromBytes(
-          call.acknowledge_offer_operation_update().status_uuid());
+      Try<id::UUID> uuid = id::UUID::fromBytes(
+          call.acknowledge_operation_status().uuid());
       if (uuid.isError()) {
         return uuid.error();
       }
@@ -615,9 +610,9 @@ Option<Error> validate(
       }
       return None();
 
-    case mesos::scheduler::Call::RECONCILE_OFFER_OPERATIONS:
-      if (!call.has_reconcile_offer_operations()) {
-        return Error("Expecting 'reconcile_offer_operations' to be present");
+    case mesos::scheduler::Call::RECONCILE_OPERATIONS:
+      if (!call.has_reconcile_operations()) {
+        return Error("Expecting 'reconcile_operations' to be present");
       }
       return None();
 
@@ -1404,7 +1399,7 @@ Option<Error> validateExecutor(
         << "Executor '" << task.executor().executor_id()
         << "' for task '" << task.task_id()
         << "' uses less memory ("
-        << (mem.isSome() ? stringify(mem.get().megabytes()) : "None")
+        << (mem.isSome() ? stringify(mem.get()) : "None")
         << ") than the minimum required (" << MIN_MEM
         << "). Please update your executor, as this will be mandatory "
         << "in future releases.";
@@ -1587,7 +1582,7 @@ Option<Error> validateExecutor(
     return Error(
       "Executor '" + stringify(executor.executor_id()) +
       "' uses less memory (" +
-      (mem.isSome() ? stringify(mem.get().megabytes()) : "None") +
+      (mem.isSome() ? stringify(mem.get()) : "None") +
       ") than the minimum required (" + stringify(MIN_MEM) + ")");
   }
 
@@ -1932,6 +1927,9 @@ Option<Error> validateInverseOffers(
 
 namespace operation {
 
+// TODO(jieyu): Validate that resources in an operation is not empty.
+
+
 Option<Error> validate(
     const Offer::Operation::Reserve& reserve,
     const Option<Principal>& principal,
@@ -1940,6 +1938,12 @@ Option<Error> validate(
 {
   // NOTE: this ensures the reservation is not being made to the "*" role.
   Option<Error> error = resource::validate(reserve.resources());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error.get().message);
+  }
+
+  error =
+    resource::internal::validateSingleResourceProvider(reserve.resources());
   if (error.isSome()) {
     return Error("Invalid resources: " + error.get().message);
   }
@@ -2082,6 +2086,12 @@ Option<Error> validate(
     return Error("Invalid resources: " + error.get().message);
   }
 
+  error =
+    resource::internal::validateSingleResourceProvider(unreserve.resources());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error.get().message);
+  }
+
   // NOTE: We don't check that 'FrameworkInfo.principal' matches
   // 'Resource.ReservationInfo.principal' here because the authorization
   // depends on the "unreserve" ACL which specifies which 'principal' can
@@ -2115,6 +2125,11 @@ Option<Error> validate(
     const Option<FrameworkInfo>& frameworkInfo)
 {
   Option<Error> error = resource::validate(create.volumes());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error.get().message);
+  }
+
+  error = resource::internal::validateSingleResourceProvider(create.volumes());
   if (error.isSome()) {
     return Error("Invalid resources: " + error.get().message);
   }
@@ -2234,13 +2249,24 @@ Option<Error> validate(
     return Error("Invalid resources: " + error.get().message);
   }
 
+  error = resource::internal::validateSingleResourceProvider(volumes);
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error.get().message);
+  }
+
   error = resource::validatePersistentVolume(volumes);
   if (error.isSome()) {
     return Error("Not a persistent volume: " + error.get().message);
   }
 
-  if (!checkpointedResources.contains(volumes)) {
-    return Error("Persistent volumes not found");
+  foreach (const Resource volume, volumes) {
+    if (Resources::hasResourceProvider(volume)) {
+      continue;
+    }
+
+    if (!checkpointedResources.contains(volume)) {
+      return Error("Persistent volumes not found");
+    }
   }
 
   // Ensure the volumes being destroyed are not in use currently.

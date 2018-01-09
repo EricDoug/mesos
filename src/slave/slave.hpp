@@ -98,6 +98,7 @@ namespace mesos {
 
 // Forward declarations.
 class Authorizer;
+class VolumeProfileAdaptor;
 
 namespace internal {
 namespace slave {
@@ -108,6 +109,7 @@ class Executor;
 class Framework;
 
 struct HttpConnection;
+struct ResourceProvider;
 
 
 class Slave : public ProtobufProcess<Slave>
@@ -148,13 +150,15 @@ public:
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
       const process::UPID& pid,
-      const TaskInfo& task);
+      const TaskInfo& task,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids);
 
   void run(
       const FrameworkInfo& frameworkInfo,
       ExecutorInfo executorInfo,
       Option<TaskInfo> task,
       Option<TaskGroupInfo> taskGroup,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const process::UPID& pid);
 
   // Made 'virtual' for Slave mocking.
@@ -163,14 +167,16 @@ public:
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
       const Option<TaskInfo>& task,
-      const Option<TaskGroupInfo>& taskGroup);
+      const Option<TaskGroupInfo>& taskGroup,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids);
 
   // Made 'virtual' for Slave mocking.
   virtual void runTaskGroup(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
-      const TaskGroupInfo& taskGroupInfo);
+      const TaskGroupInfo& taskGroupInfo,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids);
 
   // Made 'virtual' for Slave mocking.
   virtual void killTask(
@@ -203,7 +209,13 @@ public:
   void checkpointResourcesMessage(
       const std::vector<Resource>& checkpointedResources);
 
-  void applyOfferOperation(const ApplyOfferOperationMessage& message);
+  void applyOperation(const ApplyOperationMessage& message);
+
+  // Reconciles pending operations with the master. This is necessary to handle
+  // cases in which operations were dropped in transit, or in which an agent's
+  // `UpdateSlaveMessage` was sent at the same time as an operation was en route
+  // from the master to the agent.
+  void reconcileOperations(const ReconcileOperationsMessage& message);
 
   void subscribe(
       HttpConnection http,
@@ -290,15 +302,15 @@ public:
       const TaskID& taskId,
       const std::string& uuid);
 
-  void offerOperationUpdateAcknowledgement(
-      const process::UPID& from,
-      const OfferOperationUpdateAcknowledgementMessage& acknowledgement);
-
   void _statusUpdateAcknowledgement(
       const process::Future<bool>& future,
       const TaskID& taskId,
       const FrameworkID& frameworkId,
-      const UUID& uuid);
+      const id::UUID& uuid);
+
+  void operationStatusAcknowledgement(
+      const process::UPID& from,
+      const AcknowledgeOperationStatusMessage& acknowledgement);
 
   void executorLaunched(
       const FrameworkID& frameworkId,
@@ -321,6 +333,10 @@ public:
   // mock both GarbageCollector (and pass it through slave's constructor)
   // and os calls.
   void _checkDiskUsage(const process::Future<double>& usage);
+
+  // Garbage collect image layers based on the disk usage of image
+  // store.
+  void _checkImageDiskUsage(const process::Future<double>& usage);
 
   // Invoked whenever the detector detects a change in masters.
   // Made public for testing purposes.
@@ -360,7 +376,8 @@ public:
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
       const Option<TaskInfo>& task,
-      const Option<TaskGroupInfo>& taskGroup);
+      const Option<TaskGroupInfo>& taskGroup,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids);
 
   // This is called when the resource limits of the container have
   // been updated for the given tasks and task groups. If the update is
@@ -429,6 +446,10 @@ public:
 
   // Checks the current disk usage and schedules for gc as necessary.
   void checkDiskUsage();
+
+  // Checks the current container image disk usage and trigger image
+  // gc if necessary.
+  void checkImageDiskUsage();
 
   // Recovers the slave, task status update manager and isolator.
   process::Future<Nothing> recover(const Try<state::State>& state);
@@ -536,22 +557,40 @@ private:
   void _forwardOversubscribed(
       const process::Future<Resources>& oversubscribable);
 
+  // Helper functions to generate `UpdateSlaveMessage` for either
+  // just updates to resource provider-related information, or both
+  // resource provider-related information and oversubscribed
+  // resources.
+  UpdateSlaveMessage generateResourceProviderUpdate() const;
+  UpdateSlaveMessage generateUpdateSlaveMessage() const;
+
   void handleResourceProviderMessage(
       const process::Future<ResourceProviderMessage>& message);
 
-  void addOfferOperation(OfferOperation* operation);
+  void addOperation(Operation* operation);
 
-  // Transitions the offer operation, and recovers resource if the
-  // offer operation becomes terminal.
-  void updateOfferOperation(
-      OfferOperation* operation,
-      const OfferOperationStatusUpdate& update);
+  // Transitions the operation, and recovers resource if the operation becomes
+  // terminal.
+  void updateOperation(
+      Operation* operation,
+      const UpdateOperationStatusMessage& update);
 
-  void removeOfferOperation(OfferOperation* operation);
+  void removeOperation(Operation* operation);
 
-  OfferOperation* getOfferOperation(const UUID& uuid) const;
+  Operation* getOperation(const id::UUID& uuid) const;
 
-  void apply(const std::vector<ResourceConversion>& conversions);
+  void addResourceProvider(ResourceProvider* resourceProvider);
+  ResourceProvider* getResourceProvider(const ResourceProviderID& id) const;
+
+  void apply(Operation* operation);
+
+  // Publish all resources that are needed to run the current set of
+  // tasks and executors on the agent.
+  // NOTE: The `additionalResources` parameter is for publishing
+  // additional task resources when launching executors. Consider
+  // removing this parameter once we revisited MESOS-600.
+  process::Future<Nothing> publishResources(
+      const Option<Resources>& additionalResources = None());
 
   // Gauge methods.
   double _frameworks_active()
@@ -587,6 +626,15 @@ private:
   double _resources_revocable_total(const std::string& name);
   double _resources_revocable_used(const std::string& name);
   double _resources_revocable_percent(const std::string& name);
+
+  // Checks whether the two `SlaveInfo` objects are considered
+  // compatible based on the value of the `--configuration_policy`
+  // flag.
+  Try<Nothing> compatible(
+      const SlaveInfo& previous,
+      const SlaveInfo& current) const;
+
+  protobuf::master::Capabilities requiredMasterCapabilities;
 
   const Flags flags;
 
@@ -677,6 +725,8 @@ private:
 
   mesos::slave::QoSController* qosController;
 
+  std::shared_ptr<VolumeProfileAdaptor> volumeProfileAdaptor;
+
   mesos::SecretGenerator* secretGenerator;
 
   const Option<Authorizer*> authorizer;
@@ -687,11 +737,29 @@ private:
 
   ResourceProviderManager resourceProviderManager;
   process::Owned<LocalResourceProviderDaemon> localResourceProviderDaemon;
-  hashmap<Option<ResourceProviderID>, UUID> resourceVersions;
 
-  // Pending operations or terminal operations that have
-  // unacknowledged status updates.
-  hashmap<UUID, OfferOperation*> offerOperations;
+  // Local resource providers known by the agent.
+  hashmap<ResourceProviderID, ResourceProvider*> resourceProviders;
+
+  // Used to establish the relationship between the operation and the
+  // resources that the operation is operating on. Each resource
+  // provider will keep a resource version UUID, and change it when it
+  // believes that the resources from this resource provider are out
+  // of sync from the master's view.  The master will keep track of
+  // the last known resource version UUID for each resource provider,
+  // and attach the resource version UUID in each operation it sends
+  // out. The resource provider should reject operations that have a
+  // different resource version UUID than that it maintains, because
+  // this means the operation is operating on resources that might
+  // have already been invalidated.
+  id::UUID resourceVersion;
+
+  // Keeps track of the following:
+  // (1) Pending operations for resources from the agent.
+  // (2) Pending operations or terminal operations that have
+  //     unacknowledged status updates for resource provider
+  //     provided resources.
+  hashmap<id::UUID, Operation*> operations;
 };
 
 
@@ -787,8 +855,10 @@ public:
     }
   }
 
-  // Returns true if this is a command executor.
-  bool isCommandExecutor() const;
+  // Returns true if this executor is generated by Mesos for a command
+  // task (either command executor for MesosContainerizer or docker
+  // executor for DockerContainerizer).
+  bool isGeneratedForCommandTask() const;
 
   // Closes the HTTP connection.
   void closeHttpConnection();
@@ -879,7 +949,7 @@ private:
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
-  bool commandExecutor;
+  bool isGeneratedForCommandTask_;
 };
 
 
@@ -986,6 +1056,41 @@ public:
 private:
   Framework(const Framework&) = delete;
   Framework& operator=(const Framework&) = delete;
+};
+
+
+struct ResourceProvider
+{
+  ResourceProvider(
+      const ResourceProviderInfo& _info,
+      const Resources& _totalResources,
+      const id::UUID& _resourceVersion)
+    : info(_info),
+      totalResources(_totalResources),
+      resourceVersion(_resourceVersion) {}
+
+  void addOperation(Operation* operation);
+  void removeOperation(Operation* operation);
+
+  ResourceProviderInfo info;
+  Resources totalResources;
+
+  // Used to establish the relationship between the operation and the
+  // resources that the operation is operating on. Each resource
+  // provider will keep a resource version UUID, and change it when it
+  // believes that the resources from this resource provider are out
+  // of sync from the master's view.  The master will keep track of
+  // the last known resource version UUID for each resource provider,
+  // and attach the resource version UUID in each operation it sends
+  // out. The resource provider should reject operations that have a
+  // different resource version UUID than that it maintains, because
+  // this means the operation is operating on resources that might
+  // have already been invalidated.
+  id::UUID resourceVersion;
+
+  // Pending operations or terminal operations that have
+  // unacknowledged status updates.
+  hashmap<id::UUID, Operation*> operations;
 };
 
 

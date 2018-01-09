@@ -535,7 +535,7 @@ Future<ProvisionInfo> ProvisionerProcess::_provision(
 {
   CHECK(backends.contains(backend));
 
-  string rootfsId = UUID::random().toString();
+  string rootfsId = id::UUID::random().toString();
 
   string rootfs = provisioner::paths::getContainerRootfsDir(
       rootDir,
@@ -554,6 +554,7 @@ Future<ProvisionInfo> ProvisionerProcess::_provision(
   }
 
   infos[containerId]->rootfses[backend].insert(rootfsId);
+  infos[containerId]->layers = imageInfo.layers;
 
   string backendDir = provisioner::paths::getBackendDir(
       rootDir,

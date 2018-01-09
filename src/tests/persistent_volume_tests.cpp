@@ -172,18 +172,15 @@ protected:
   {
     slave::Flags slaveFlags = MesosTest::CreateSlaveFlags();
     if (::testing::get<1>(GetParam()) == ENABLED) {
-      constexpr SlaveInfo::Capability::Type capabilities[] = {
-        SlaveInfo::Capability::MULTI_ROLE,
-        SlaveInfo::Capability::HIERARCHICAL_ROLE,
-        SlaveInfo::Capability::RESERVATION_REFINEMENT,
-        SlaveInfo::Capability::RESOURCE_PROVIDER};
+      // Set the resource provider capability.
+      vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+      SlaveInfo::Capability capability;
+      capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+      capabilities.push_back(capability);
 
       slaveFlags.agent_features = SlaveCapabilities();
-      foreach (SlaveInfo::Capability::Type type, capabilities) {
-        SlaveInfo::Capability* capability =
-          slaveFlags.agent_features->add_capabilities();
-        capability->set_type(type);
-      }
+      slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+          {capabilities.begin(), capabilities.end()});
     }
 
     return slaveFlags;
@@ -195,8 +192,8 @@ protected:
   Future<Resources> getOperationMessage(To to)
   {
     if (::testing::get<1>(GetParam()) == ENABLED) {
-      return FUTURE_PROTOBUF(ApplyOfferOperationMessage(), _, to)
-        .then([](const ApplyOfferOperationMessage& message) {
+      return FUTURE_PROTOBUF(ApplyOperationMessage(), _, to)
+        .then([](const ApplyOperationMessage& message) {
           switch (message.operation_info().type()) {
             case Offer::Operation::UNKNOWN:
             case Offer::Operation::LAUNCH:
@@ -260,7 +257,7 @@ protected:
     switch (::testing::get<0>(GetParam())) {
       case NONE: {
         diskResource = createDiskResource(
-            stringify(mb.megabytes()),
+            stringify((double) mb.bytes() / Bytes::MEGABYTES),
             DEFAULT_TEST_ROLE,
             None(),
             None());
@@ -269,7 +266,7 @@ protected:
       }
       case PATH: {
         diskResource = createDiskResource(
-            stringify(mb.megabytes()),
+            stringify((double) mb.bytes() / Bytes::MEGABYTES),
             DEFAULT_TEST_ROLE,
             None(),
             None(),
@@ -279,7 +276,7 @@ protected:
       }
       case MOUNT: {
         diskResource = createDiskResource(
-            stringify(mb.megabytes()),
+            stringify((double) mb.bytes() / Bytes::MEGABYTES),
             DEFAULT_TEST_ROLE,
             None(),
             None(),
@@ -1552,7 +1549,9 @@ TEST_P(PersistentVolumeTest, SharedPersistentVolumeMultipleFrameworks)
 // volume are still running.
 TEST_P(PersistentVolumeTest, SharedPersistentVolumeMasterFailover)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry = "replicated_log";
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   StandaloneMasterDetector detector(master.get()->pid);
@@ -1661,7 +1660,7 @@ TEST_P(PersistentVolumeTest, SharedPersistentVolumeMasterFailover)
     .WillOnce(FutureArg<1>(&offers2))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
-  master = StartMaster();
+  master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   // Simulate a new master detected event on the slave so that the

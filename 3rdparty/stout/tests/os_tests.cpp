@@ -210,16 +210,13 @@ TEST_F(OsTest, Nonblock)
 #endif // __WINDOWS__
 
 
-// TODO(hausdorff): Fix this issue and enable the test on Windows. It fails
-// because `os::size` is not following symlinks correctly on Windows. See
-// MESOS-5939.
 // Tests whether a file's size is reported by os::stat::size as expected.
 // Tests all four combinations of following a link or not and of a file
 // or a link as argument. Also tests that an error is returned for a
 // non-existing file.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, SYMLINK_Size)
+TEST_F(OsTest, SYMLINK_Size)
 {
-  const string file = path::join(os::getcwd(), UUID::random().toString());
+  const string file = path::join(os::getcwd(), id::UUID::random().toString());
 
   const Bytes size = 1053;
 
@@ -234,16 +231,24 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(OsTest, SYMLINK_Size)
 
   EXPECT_ERROR(os::stat::size("aFileThatDoesNotExist"));
 
-  const string link = path::join(os::getcwd(), UUID::random().toString());
+  const string link = path::join(os::getcwd(), id::UUID::random().toString());
 
   ASSERT_SOME(fs::symlink(file, link));
 
   // Following links we expect the file's size, not the link's.
   EXPECT_SOME_EQ(size, os::stat::size(link, FollowSymlink::FOLLOW_SYMLINK));
 
-  // Not following links, we expect the string length of the linked path.
-  EXPECT_SOME_EQ(Bytes(file.size()),
+#ifdef __WINDOWS__
+  // On Windows, the reported size of a symlink is zero.
+  EXPECT_SOME_EQ(
+      Bytes(0),
       os::stat::size(link, FollowSymlink::DO_NOT_FOLLOW_SYMLINK));
+#else
+  // Not following links, we expect the string length of the linked path.
+  EXPECT_SOME_EQ(
+      Bytes(file.size()),
+      os::stat::size(link, FollowSymlink::DO_NOT_FOLLOW_SYMLINK));
+#endif // __WINDOWS__
 }
 
 
@@ -719,15 +724,15 @@ TEST_F(OsTest, User)
   // A random UUID is an invalid username on some platforms. Some
   // versions of Linux (e.g., RHEL7) treat invalid usernames
   // differently from valid-but-not-found usernames.
-  EXPECT_NONE(os::getuid(UUID::random().toString()));
-  EXPECT_NONE(os::getgid(UUID::random().toString()));
+  EXPECT_NONE(os::getuid(id::UUID::random().toString()));
+  EXPECT_NONE(os::getgid(id::UUID::random().toString()));
 
   // A username that is valid but that is unlikely to exist.
   EXPECT_NONE(os::getuid("zzzvaliduserzzz"));
   EXPECT_NONE(os::getgid("zzzvaliduserzzz"));
 
   EXPECT_SOME(os::su(user.get()));
-  EXPECT_ERROR(os::su(UUID::random().toString()));
+  EXPECT_ERROR(os::su(id::UUID::random().toString()));
 
   Try<string> gids_ = os::shell("id -G " + user.get());
   EXPECT_SOME(gids_);
@@ -1004,7 +1009,7 @@ TEST_F(OsTest, SYMLINK_Realpath)
   const string& testFile = _testFile.get();
 
   // Create a symlink pointing to a file.
-  const string testLink = UUID::random().toString();
+  const string testLink = id::UUID::random().toString();
   ASSERT_SOME(fs::symlink(testFile, testLink));
 
   // Validate the symlink.

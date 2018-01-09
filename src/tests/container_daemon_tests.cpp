@@ -89,8 +89,6 @@ TEST_F(ContainerDaemonTest, RestartOnTermination)
   ASSERT_SOME(jwtSecretKey);
 
   secretGenerator.reset(new JWTSecretGenerator(jwtSecretKey.get()));
-#else
-  slaveFlags.authenticate_http_readwrite = false;
 #endif // USE_SSL_SOCKET
 
   Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
@@ -125,13 +123,13 @@ TEST_F(ContainerDaemonTest, RestartOnTermination)
   // containers is to check if the container ID prefix in the claims
   // of the principal is indeed a prefix of the container ID that is
   // specified in the API call.
-  string containerIdPrefix = UUID::random().toString();
+  string containerIdPrefix = id::UUID::random().toString();
 
   ContainerID containerId;
   containerId.set_value(strings::join(
         "-",
         containerIdPrefix,
-        UUID::random().toString()));
+        id::UUID::random().toString()));
 
   Principal principal(
       None(),
@@ -235,11 +233,11 @@ TEST_F(ContainerDaemonTest, FailedAuthorization)
   // Using two random UUIDs here guarantees that one is not a prefix
   // of another. Therefore, the authorization will fail.
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Principal principal(
       None(),
-      {{"cid_prefix", UUID::random().toString()}});
+      {{"cid_prefix", id::UUID::random().toString()}});
 
   Future<Secret> secret = secretGenerator->generate(principal);
   AWAIT_READY(secret);

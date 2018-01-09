@@ -90,7 +90,9 @@ using process::http::UnsupportedMediaType;
 using std::string;
 using std::vector;
 
+using testing::DoAll;
 using testing::Eq;
+using testing::Invoke;
 using testing::SaveArg;
 using testing::Values;
 using testing::WithParamInterface;
@@ -110,18 +112,15 @@ public:
 
     slaveFlags.authenticate_http_readwrite = false;
 
-    constexpr SlaveInfo::Capability::Type capabilities[] = {
-      SlaveInfo::Capability::MULTI_ROLE,
-      SlaveInfo::Capability::HIERARCHICAL_ROLE,
-      SlaveInfo::Capability::RESERVATION_REFINEMENT,
-      SlaveInfo::Capability::RESOURCE_PROVIDER};
+    // Set the resource provider capability.
+    vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+    SlaveInfo::Capability capability;
+    capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+    capabilities.push_back(capability);
 
     slaveFlags.agent_features = SlaveCapabilities();
-    foreach (SlaveInfo::Capability::Type type, capabilities) {
-      SlaveInfo::Capability* capability =
-        slaveFlags.agent_features->add_capabilities();
-      capability->set_type(type);
-    }
+    slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+        {capabilities.begin(), capabilities.end()});
 
     return slaveFlags;
   }
@@ -249,7 +248,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
 
   ResourceProviderManager manager;
 
-  Option<UUID> streamId;
+  Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
 
   // First, subscribe to the manager to get the ID.
@@ -278,7 +277,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
     ASSERT_EQ(http::Response::PIPE, response->type);
 
     ASSERT_TRUE(response->headers.contains("Mesos-Stream-Id"));
-    Try<UUID> uuid = UUID::fromString(response->headers.at("Mesos-Stream-Id"));
+    Try<id::UUID> uuid =
+      id::UUID::fromString(response->headers.at("Mesos-Stream-Id"));
 
     CHECK_SOME(uuid);
     streamId = uuid.get();
@@ -318,7 +318,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
     Call::UpdateState* updateState = call.mutable_update_state();
 
     updateState->mutable_resources()->CopyFrom(v1::Resources(resources));
-    updateState->set_resource_version_uuid(UUID::random().toBytes());
+    updateState->mutable_resource_version_uuid()->set_value(
+        id::UUID::random().toBytes());
 
     http::Request request;
     request.method = "POST";
@@ -339,19 +340,22 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateState)
     AWAIT_READY(message);
 
     EXPECT_EQ(ResourceProviderMessage::Type::UPDATE_STATE, message->type);
-    EXPECT_EQ(devolve(resourceProviderId.get()), message->updateState->id);
-    EXPECT_EQ(devolve(resources), message->updateState->total);
+    ASSERT_TRUE(message->updateState->info.has_id());
+    EXPECT_EQ(
+        devolve(resourceProviderId.get()),
+        message->updateState->info.id());
+    EXPECT_EQ(devolve(resources), message->updateState->totalResources);
   }
 }
 
 
-TEST_P(ResourceProviderManagerHttpApiTest, UpdateOfferOperationStatus)
+TEST_P(ResourceProviderManagerHttpApiTest, UpdateOperationStatus)
 {
   const ContentType contentType = GetParam();
 
   ResourceProviderManager manager;
 
-  Option<UUID> streamId;
+  Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
 
   // First, subscribe to the manager to get the ID.
@@ -380,7 +384,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOfferOperationStatus)
     ASSERT_EQ(http::Response::PIPE, response->type);
 
     ASSERT_TRUE(response->headers.contains("Mesos-Stream-Id"));
-    Try<UUID> uuid = UUID::fromString(response->headers.at("Mesos-Stream-Id"));
+    Try<id::UUID> uuid =
+      id::UUID::fromString(response->headers.at("Mesos-Stream-Id"));
 
     CHECK_SOME(uuid);
     streamId = uuid.get();
@@ -405,25 +410,26 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOfferOperationStatus)
     EXPECT_FALSE(resourceProviderId->value().empty());
   }
 
-  // Then, send an offer operation update to the manager.
+  // Then, send an operation status update to the manager.
   {
     v1::FrameworkID frameworkId;
     frameworkId.set_value("foo");
 
-    mesos::v1::OfferOperationStatus status;
-    status.set_state(mesos::v1::OfferOperationState::OFFER_OPERATION_FINISHED);
+    mesos::v1::OperationStatus status;
+    status.set_state(mesos::v1::OperationState::OPERATION_FINISHED);
 
-    UUID operationUUID = UUID::random();
+    mesos::v1::UUID operationUUID;
+    operationUUID.set_value(id::UUID::random().toBytes());
 
     Call call;
-    call.set_type(Call::UPDATE_OFFER_OPERATION_STATUS);
+    call.set_type(Call::UPDATE_OPERATION_STATUS);
     call.mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
 
-    Call::UpdateOfferOperationStatus* updateOfferOperationStatus =
-      call.mutable_update_offer_operation_status();
-    updateOfferOperationStatus->mutable_framework_id()->CopyFrom(frameworkId);
-    updateOfferOperationStatus->mutable_status()->CopyFrom(status);
-    updateOfferOperationStatus->set_operation_uuid(operationUUID.toBytes());
+    Call::UpdateOperationStatus* updateOperationStatus =
+      call.mutable_update_operation_status();
+    updateOperationStatus->mutable_framework_id()->CopyFrom(frameworkId);
+    updateOperationStatus->mutable_status()->CopyFrom(status);
+    updateOperationStatus->mutable_operation_uuid()->CopyFrom(operationUUID);
 
     http::Request request;
     request.method = "POST";
@@ -438,37 +444,37 @@ TEST_P(ResourceProviderManagerHttpApiTest, UpdateOfferOperationStatus)
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, response);
 
     // The manager will send out a message informing its subscriber
-    // about the updated offer operation.
+    // about the updated operation.
     Future<ResourceProviderMessage> message = manager.messages().get();
 
     AWAIT_READY(message);
 
     EXPECT_EQ(
-        ResourceProviderMessage::Type::UPDATE_OFFER_OPERATION_STATUS,
+        ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS,
         message->type);
     EXPECT_EQ(
         devolve(frameworkId),
-        message->updateOfferOperationStatus->update.framework_id());
+        message->updateOperationStatus->update.framework_id());
     EXPECT_EQ(
         devolve(status).state(),
-        message->updateOfferOperationStatus->update.status().state());
+        message->updateOperationStatus->update.status().state());
     EXPECT_EQ(
-        operationUUID.toBytes(),
-        message->updateOfferOperationStatus->update.operation_uuid());
+        operationUUID.value(),
+        message->updateOperationStatus->update.operation_uuid().value());
   }
 }
 
 
 // This test verifies that the pending future returned by
-// `ResourceProviderManager::publish()` becomes ready when the manager
+// `ResourceProviderManager::publishResources()` becomes ready when the manager
 // receives an publish status update with an `OK` status.
-TEST_P(ResourceProviderManagerHttpApiTest, PublishSuccess)
+TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesSuccess)
 {
   const ContentType contentType = GetParam();
 
   ResourceProviderManager manager;
 
-  Option<UUID> streamId;
+  Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
   Owned<recordio::Reader<Event>> responseDecoder;
 
@@ -498,7 +504,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishSuccess)
     ASSERT_EQ(http::Response::PIPE, response->type);
 
     ASSERT_TRUE(response->headers.contains("Mesos-Stream-Id"));
-    Try<UUID> uuid = UUID::fromString(response->headers.at("Mesos-Stream-Id"));
+    Try<id::UUID> uuid =
+      id::UUID::fromString(response->headers.at("Mesos-Stream-Id"));
 
     CHECK_SOME(uuid);
     streamId = uuid.get();
@@ -531,20 +538,21 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishSuccess)
       resource.mutable_provider_id()->CopyFrom(resourceProviderId.get());
     }
 
-    Future<Nothing> published = manager.publish(devolve(resources));
+    Future<Nothing> published = manager.publishResources(devolve(resources));
 
     Future<Result<Event>> event = responseDecoder->read();
     AWAIT_READY(event);
     ASSERT_SOME(event.get());
-    ASSERT_EQ(Event::PUBLISH, event->get().type());
+    ASSERT_EQ(Event::PUBLISH_RESOURCES, event->get().type());
 
     Call call;
-    call.set_type(Call::UPDATE_PUBLISH_STATUS);
+    call.set_type(Call::UPDATE_PUBLISH_RESOURCES_STATUS);
     call.mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
 
-    Call::UpdatePublishStatus* update = call.mutable_update_publish_status();
-    update->set_uuid(event->get().publish().uuid());
-    update->set_status(Call::UpdatePublishStatus::OK);
+    Call::UpdatePublishResourcesStatus* update =
+      call.mutable_update_publish_resources_status();
+    update->mutable_uuid()->CopyFrom(event->get().publish_resources().uuid());
+    update->set_status(Call::UpdatePublishResourcesStatus::OK);
 
     http::Request request;
     request.method = "POST";
@@ -565,15 +573,15 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishSuccess)
 
 
 // This test verifies that the pending future returned by
-// `ResourceProviderManager::publish()` becomes failed when the manager
+// `ResourceProviderManager::publishResources()` becomes failed when the manager
 // receives an publish status update with a `FAILED` status.
-TEST_P(ResourceProviderManagerHttpApiTest, PublishFailure)
+TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesFailure)
 {
   const ContentType contentType = GetParam();
 
   ResourceProviderManager manager;
 
-  Option<UUID> streamId;
+  Option<id::UUID> streamId;
   Option<mesos::v1::ResourceProviderID> resourceProviderId;
   Owned<recordio::Reader<Event>> responseDecoder;
 
@@ -603,7 +611,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishFailure)
     ASSERT_EQ(http::Response::PIPE, response->type);
 
     ASSERT_TRUE(response->headers.contains("Mesos-Stream-Id"));
-    Try<UUID> uuid = UUID::fromString(response->headers.at("Mesos-Stream-Id"));
+    Try<id::UUID> uuid =
+      id::UUID::fromString(response->headers.at("Mesos-Stream-Id"));
 
     CHECK_SOME(uuid);
     streamId = uuid.get();
@@ -636,20 +645,21 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishFailure)
       resource.mutable_provider_id()->CopyFrom(resourceProviderId.get());
     }
 
-    Future<Nothing> published = manager.publish(devolve(resources));
+    Future<Nothing> published = manager.publishResources(devolve(resources));
 
     Future<Result<Event>> event = responseDecoder->read();
     AWAIT_READY(event);
     ASSERT_SOME(event.get());
-    ASSERT_EQ(Event::PUBLISH, event->get().type());
+    ASSERT_EQ(Event::PUBLISH_RESOURCES, event->get().type());
 
     Call call;
-    call.set_type(Call::UPDATE_PUBLISH_STATUS);
+    call.set_type(Call::UPDATE_PUBLISH_RESOURCES_STATUS);
     call.mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
 
-    Call::UpdatePublishStatus* update = call.mutable_update_publish_status();
-    update->set_uuid(event->get().publish().uuid());
-    update->set_status(Call::UpdatePublishStatus::FAILED);
+    Call::UpdatePublishResourcesStatus* update =
+      call.mutable_update_publish_resources_status();
+    update->mutable_uuid()->CopyFrom(event->get().publish_resources().uuid());
+    update->set_status(Call::UpdatePublishResourcesStatus::FAILED);
 
     http::Request request;
     request.method = "POST";
@@ -670,9 +680,9 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishFailure)
 
 
 // This test verifies that the pending future returned by
-// `ResourceProviderManager::publish()` becomes failed when the resource
-// provider is disconnected.
-TEST_P(ResourceProviderManagerHttpApiTest, PublishDisconnected)
+// `ResourceProviderManager::publishResources()` becomes failed when the
+// resource provider is disconnected.
+TEST_P(ResourceProviderManagerHttpApiTest, PublishResourcesDisconnected)
 {
   const ContentType contentType = GetParam();
 
@@ -727,7 +737,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishDisconnected)
     EXPECT_FALSE(resourceProviderId->value().empty());
   }
 
-  // Then, close the connection after receiving a publish event.
+  // Then, close the connection after receiving a publish resources event.
   {
     vector<v1::Resource> resources =
       v1::Resources::fromString("disk:4").get();
@@ -735,12 +745,12 @@ TEST_P(ResourceProviderManagerHttpApiTest, PublishDisconnected)
       resource.mutable_provider_id()->CopyFrom(resourceProviderId.get());
     }
 
-    Future<Nothing> published = manager.publish(devolve(resources));
+    Future<Nothing> published = manager.publishResources(devolve(resources));
 
     Future<Result<Event>> event = responseDecoder->read();
     AWAIT_READY(event);
     ASSERT_SOME(event.get());
-    ASSERT_EQ(Event::PUBLISH, event->get().type());
+    ASSERT_EQ(Event::PUBLISH_RESOURCES, event->get().type());
 
     reader->close();
 
@@ -1097,8 +1107,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
   v1::Resource disk = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  v1::MockResourceProvider resourceProvider(
-      resourceProviderInfo, Some(v1::Resources(disk)));
+  Owned<v1::MockResourceProvider> resourceProvider(
+      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   // Start and register a resource provider.
   string scheme = "http";
@@ -1119,29 +1129,36 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
 
   const ContentType contentType = GetParam();
 
-  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+  resourceProvider->start(
+      endpointDetector,
+      contentType,
+      v1::DEFAULT_CREDENTIAL);
 
   // Wait until the agent's resources have been updated to include the
   // resource provider resources. At this point the resource provider
   // will have an ID assigned by the agent.
   AWAIT_READY(updateSlaveMessage);
 
-  mesos::v1::ResourceProviderID resourceProviderId = resourceProvider.info.id();
+  ASSERT_TRUE(resourceProvider->info.has_id());
 
-  Future<Event::Subscribed> subscribed1;
-  EXPECT_CALL(resourceProvider, subscribed(_))
-    .WillOnce(FutureArg<0>(&subscribed1));
+  resourceProviderInfo = resourceProvider->info;
 
   // Resource provider failover by opening a new connection.
   // The assigned resource provider ID will be used to resubscribe.
-  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+  resourceProvider.reset(
+      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
+
+  Future<Event::Subscribed> subscribed1;
+  EXPECT_CALL(*resourceProvider, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed1));
+
+  resourceProvider->start(
+      endpointDetector,
+      contentType,
+      v1::DEFAULT_CREDENTIAL);
 
   AWAIT_READY(subscribed1);
-  EXPECT_EQ(resourceProviderId, subscribed1->provider_id());
-
-  Future<Event::Subscribed> subscribed2;
-  EXPECT_CALL(resourceProvider, subscribed(_))
-    .WillOnce(FutureArg<0>(&subscribed2));
+  EXPECT_EQ(resourceProviderInfo.id(), subscribed1->provider_id());
 
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
@@ -1162,10 +1179,213 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeResourceProvider)
 
   endpointDetector.reset(new ConstantEndpointDetector(url));
 
-  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+  resourceProvider.reset(new v1::MockResourceProvider(
+      resourceProviderInfo,
+      Some(v1::Resources(disk))));
+
+  Future<Event::Subscribed> subscribed2;
+  EXPECT_CALL(*resourceProvider, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed2));
+
+  resourceProvider->start(
+      endpointDetector,
+      contentType,
+      v1::DEFAULT_CREDENTIAL);
 
   AWAIT_READY(subscribed2);
-  EXPECT_EQ(resourceProviderId, subscribed2->provider_id());
+  EXPECT_EQ(resourceProviderInfo.id(), subscribed2->provider_id());
+}
+
+
+// This test verifies that a disconnected resource provider will
+// result in an `UpdateSlaveMessage` to be sent to the master and the
+// total resources of the disconnected resource provider will be
+// reduced to empty.
+TEST_P(ResourceProviderManagerHttpApiTest, ResourceProviderDisconnect)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(updateSlaveMessage);
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  v1::Resource disk = v1::createDiskResource(
+      "200", "*", None(), None(), v1::createDiskSourceRaw());
+
+  Owned<v1::MockResourceProvider> resourceProvider(
+      new v1::MockResourceProvider(
+          resourceProviderInfo,
+          v1::Resources(disk)));
+
+  // Start and register a resource provider.
+  string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+  if (process::network::openssl::flags().enabled) {
+    scheme = "https";
+  }
+#endif
+
+  http::URL url(
+      scheme,
+      agent.get()->pid.address.ip,
+      agent.get()->pid.address.port,
+      agent.get()->pid.id + "/api/v1/resource_provider");
+
+  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+
+  const ContentType contentType = GetParam();
+
+  resourceProvider->start(
+      endpointDetector,
+      contentType,
+      v1::DEFAULT_CREDENTIAL);
+
+  {
+    // Wait until the agent's resources have been updated to include
+    // the resource provider resources. At this point the resource
+    // provider will have an ID assigned by the agent.
+    AWAIT_READY(updateSlaveMessage);
+
+    ASSERT_TRUE(resourceProvider->info.has_id());
+    disk.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+
+    const Resources& totalResources =
+      updateSlaveMessage->resource_providers().providers(0).total_resources();
+
+    EXPECT_TRUE(totalResources.contains(devolve(disk)));
+  }
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  // Simulate a resource provider disconnection.
+  resourceProvider.reset();
+
+  {
+    AWAIT_READY(updateSlaveMessage);
+    ASSERT_TRUE(updateSlaveMessage->has_resource_providers());
+    ASSERT_EQ(1, updateSlaveMessage->resource_providers().providers_size());
+
+    const Resources& totalResources =
+      updateSlaveMessage->resource_providers().providers(0).total_resources();
+
+    EXPECT_FALSE(totalResources.contains(devolve(disk)));
+  }
+}
+
+
+// This test verifies that if a second resource provider subscribes
+// with the ID of an already connected resource provider, the first
+// instance gets disconnected and the second subscription is handled
+// as a resubscription.
+TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+  AWAIT_READY(updateSlaveMessage);
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  Owned<v1::MockResourceProvider> resourceProvider1(
+      new v1::MockResourceProvider(resourceProviderInfo));
+
+  // Start and register a resource provider.
+  string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+  if (process::network::openssl::flags().enabled) {
+    scheme = "https";
+  }
+#endif
+
+  http::URL url(
+      scheme,
+      agent.get()->pid.address.ip,
+      agent.get()->pid.address.port,
+      agent.get()->pid.id + "/api/v1/resource_provider");
+
+  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+
+  Future<Event::Subscribed> subscribed1;
+  EXPECT_CALL(*resourceProvider1, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed1));
+
+  resourceProvider1->start(
+      endpointDetector,
+      ContentType::PROTOBUF,
+      v1::DEFAULT_CREDENTIAL);
+
+  AWAIT_READY(subscribed1);
+
+  resourceProviderInfo.mutable_id()->CopyFrom(subscribed1->provider_id());
+
+  // Subscribing a second resource provider with the same ID will
+  // disconnect the first instance and handle the subscription by the
+  // second resource provider as a resubscription.
+  Owned<v1::MockResourceProvider> resourceProvider2(
+      new v1::MockResourceProvider(resourceProviderInfo));
+
+  // We terminate the first resource provider once we have confirmed
+  // that it got disconnected. This avoids it to in turn resubscribe
+  // racing with the other resource provider.
+  Future<Nothing> disconnected1;
+  EXPECT_CALL(*resourceProvider1, disconnected())
+    .WillOnce(DoAll(
+        FutureSatisfy(&disconnected1),
+        Invoke([&resourceProvider1]() { resourceProvider1.reset(); })))
+    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `reset`.
+
+  Future<Event::Subscribed> subscribed2;
+  EXPECT_CALL(*resourceProvider2, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed2));
+
+  resourceProvider2->start(
+      endpointDetector,
+      ContentType::PROTOBUF,
+      v1::DEFAULT_CREDENTIAL);
+
+  AWAIT_READY(disconnected1);
+  AWAIT_READY(subscribed2);
 }
 
 } // namespace tests {

@@ -875,6 +875,33 @@ Strategy for provisioning container rootfs from images, e.g., <code>aufs</code>,
 </tr>
 <tr>
   <td>
+    --image_gc_config=VALUE
+  </td>
+  <td>
+JSON-formatted configuration for automatic container image garbage
+collection. This is an optional flag. If it is not set, it means
+the automatic container image gc is not enabled. Users have to
+trigger image gc manually via the operator API. If it is set, the
+auto image gc is enabled. This image gc config can be provided either
+as a path pointing to a local file, or as a JSON-formatted string.
+Please note that the image garbage collection only work with Mesos
+Containerizer for now.
+<p/>
+See the ImageGcConfig message in `flags.proto` for the expected
+format.
+<p/>
+Example:
+<pre><code>{
+  "image_disk_headroom": 0.1,
+  "image_disk_watch_interval": {
+    "nanoseconds": 3600
+  },
+  "excluded_images": []
+}</code></pre>
+  </td>
+</tr>
+<tr>
+  <td>
     --isolation=VALUE
   </td>
   <td>
@@ -1016,6 +1043,24 @@ The agent polls and carries out QoS corrections from the QoS
 Controller based on its observed performance of running tasks.
 The smallest interval between these corrections is controlled by
 this flag. (default: 0secs)
+  </td>
+</tr>
+<tr>
+  <td>
+    --reconfiguration_policy=VALUE
+  </td>
+  <td>
+This flag controls which agent configuration changes are considered
+acceptable when recovering the previous agent state. Possible values:
+    equal:    The old and the new state must match exactly.
+    additive: The new state must be a superset of the old state:
+              it is permitted to add additional resources, attributes
+              and domains but not to remove or to modify existing ones.
+
+Note that this only affects the checking done on the agent itself,
+the master may still reject the agent if it detects a change that it
+considers unacceptable, which, e.g., currently happens when port or hostname
+are changed. (default: equal)
   </td>
 </tr>
 <tr>

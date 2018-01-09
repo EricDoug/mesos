@@ -20,6 +20,7 @@
 #include <mesos/http.hpp>
 
 #include <mesos/v1/resources.hpp>
+#include <mesos/v1/resource_provider.hpp>
 
 #include <mesos/v1/master/master.hpp>
 
@@ -31,6 +32,8 @@
 #include <process/gtest.hpp>
 #include <process/http.hpp>
 #include <process/owned.hpp>
+
+#include <process/ssl/flags.hpp>
 
 #include <stout/gtest.hpp>
 #include <stout/jsonify.hpp>
@@ -158,6 +161,8 @@ INSTANTIATE_TEST_CASE_P(
 
 TEST_P(MasterAPITest, GetAgents)
 {
+  Clock::pause();
+
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.domain = createDomainInfo("region-abc", "zone-123");
 
@@ -167,17 +172,30 @@ TEST_P(MasterAPITest, GetAgents)
   Owned<MasterDetector> detector = master.get()->createDetector();
 
   // Start one agent.
-  Future<SlaveRegisteredMessage> agentRegisteredMessage =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+  Future<UpdateSlaveMessage> updateAgentMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
 
   slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.authenticate_http_readwrite = false;
   slaveFlags.hostname = "host";
   slaveFlags.domain = createDomainInfo("region-xyz", "zone-456");
+
+  // Set the resource provider capability.
+  vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+  SlaveInfo::Capability capability;
+  capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+  capabilities.push_back(capability);
+
+  slaveFlags.agent_features = SlaveCapabilities();
+  slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+      {capabilities.begin(), capabilities.end()});
 
   Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(agent);
 
-  AWAIT_READY(agentRegisteredMessage);
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+  AWAIT_READY(updateAgentMessage);
 
   v1::master::Call v1Call;
   v1Call.set_type(v1::master::Call::GET_AGENTS);
@@ -195,12 +213,66 @@ TEST_P(MasterAPITest, GetAgents)
   const v1::master::Response::GetAgents::Agent& v1Agent =
       v1Response->get_agents().agents(0);
 
-  ASSERT_EQ("host", v1Agent.agent_info().hostname());
-  ASSERT_EQ(evolve(slaveFlags.domain.get()), v1Agent.agent_info().domain());
-  ASSERT_EQ(agent.get()->pid, v1Agent.pid());
-  ASSERT_TRUE(v1Agent.active());
-  ASSERT_EQ(MESOS_VERSION, v1Agent.version());
-  ASSERT_EQ(4, v1Agent.total_resources_size());
+  EXPECT_EQ("host", v1Agent.agent_info().hostname());
+  EXPECT_EQ(evolve(slaveFlags.domain.get()), v1Agent.agent_info().domain());
+  EXPECT_EQ(agent.get()->pid, v1Agent.pid());
+  EXPECT_TRUE(v1Agent.active());
+  EXPECT_EQ(MESOS_VERSION, v1Agent.version());
+  EXPECT_EQ(4, v1Agent.total_resources_size());
+  EXPECT_TRUE(v1Agent.resource_providers().empty());
+
+  // Start a resource provider.
+  mesos::v1::ResourceProviderInfo info;
+  info.set_type("org.apache.mesos.rp.test");
+  info.set_name("test");
+
+  v1::MockResourceProvider resourceProvider(
+      info,
+      v1::createDiskResource(
+          "200", "*", None(), None(), v1::createDiskSourceRaw()));
+
+  // Start and register a resource provider.
+  string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+  if (process::network::openssl::flags().enabled) {
+    scheme = "https";
+  }
+#endif
+
+  http::URL url(
+      scheme,
+      agent.get()->pid.address.ip,
+      agent.get()->pid.address.port,
+      agent.get()->pid.id + "/api/v1/resource_provider");
+
+  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+
+  updateAgentMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+
+  // Wait until the agent's resources have been updated to include the
+  // resource provider resources.
+  AWAIT_READY(updateAgentMessage);
+
+  v1Response = post(master.get()->pid, v1Call, contentType);
+
+  AWAIT_READY(v1Response);
+  AWAIT_READY(v1Response);
+  ASSERT_TRUE(v1Response->IsInitialized());
+  ASSERT_EQ(v1::master::Response::GET_AGENTS, v1Response->type());
+  ASSERT_EQ(v1Response->get_agents().agents_size(), 1);
+  ASSERT_FALSE(v1Response->get_agents().agents(0).resource_providers().empty());
+
+  const mesos::v1::ResourceProviderInfo& responseInfo =
+    v1Response->get_agents()
+      .agents(0)
+      .resource_providers(0)
+      .resource_provider_info();
+
+  EXPECT_EQ(info.type(), responseInfo.type());
+  EXPECT_EQ(info.name(), responseInfo.name());
 }
 
 
@@ -4984,7 +5056,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   v1::agent::Call call;
@@ -5081,7 +5153,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, LaunchNestedContainerSession)
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   string output = "output";
@@ -5143,6 +5215,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
+  flags.authenticate_http_readwrite = true;
+
   Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> mesosContainerizer =
@@ -5202,7 +5276,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   string command = "sleep 1000";
@@ -5300,7 +5374,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   string output = "output";
@@ -5417,7 +5491,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   v1::agent::Call call;
@@ -5665,6 +5739,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_SOME(master);
 
   slave::Flags flags = CreateSlaveFlags();
+  flags.authenticate_http_readwrite = true;
+
   {
     mesos::ACL::AttachContainerInput* acl =
       flags.acls->add_attach_containers_input();
@@ -5722,7 +5798,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   {
@@ -5923,7 +5999,7 @@ TEST_F(AgentAPITest, HeaderValidation)
     call.set_type(v1::agent::Call::ATTACH_CONTAINER_OUTPUT);
 
     v1::ContainerID containerId;
-    containerId.set_value(UUID::random().toString());
+    containerId.set_value(id::UUID::random().toString());
 
     call.mutable_attach_container_output()->mutable_container_id()
       ->CopyFrom(containerId);
@@ -5947,7 +6023,7 @@ TEST_F(AgentAPITest, HeaderValidation)
   // Setting 'Message-Content-Type' header for a non-streaming request.
   {
     v1::ContainerID containerId;
-    containerId.set_value(UUID::random().toString());
+    containerId.set_value(id::UUID::random().toString());
 
     v1::agent::Call call;
     call.set_type(v1::agent::Call::ATTACH_CONTAINER_OUTPUT);
@@ -6006,6 +6082,105 @@ TEST_P(AgentAPITest, DefaultAccept)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+}
+
+
+TEST_P(AgentAPITest, GetResourceProviders)
+{
+  Clock::pause();
+
+  const ContentType contentType = GetParam();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.authenticate_http_readwrite = false;
+
+  // Set the resource provider capability.
+  vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+  SlaveInfo::Capability capability;
+  capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+  capabilities.push_back(capability);
+
+  slaveFlags.agent_features = SlaveCapabilities();
+  slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+      {capabilities.begin(), capabilities.end()});
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+  AWAIT_READY(updateSlaveMessage);
+
+  v1::agent::Call v1Call;
+  v1Call.set_type(v1::agent::Call::GET_RESOURCE_PROVIDERS);
+
+  Future<v1::agent::Response> v1Response =
+    post(slave.get()->pid, v1Call, contentType);
+
+  AWAIT_READY(v1Response);
+  ASSERT_TRUE(v1Response->IsInitialized());
+  ASSERT_EQ(v1::agent::Response::GET_RESOURCE_PROVIDERS, v1Response->type());
+
+  EXPECT_TRUE(
+      v1Response->get_resource_providers().resource_providers().empty());
+
+  mesos::v1::ResourceProviderInfo info;
+  info.set_type("org.apache.mesos.rp.test");
+  info.set_name("test");
+
+  v1::MockResourceProvider resourceProvider(
+      info,
+      v1::createDiskResource(
+          "200", "*", None(), None(), v1::createDiskSourceRaw()));
+
+  // Start and register a resource provider.
+  string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+  if (process::network::openssl::flags().enabled) {
+    scheme = "https";
+  }
+#endif
+
+  http::URL url(
+      scheme,
+      slave.get()->pid.address.ip,
+      slave.get()->pid.address.port,
+      slave.get()->pid.id + "/api/v1/resource_provider");
+
+  Owned<EndpointDetector> endpointDetector(new ConstantEndpointDetector(url));
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resourceProvider.start(endpointDetector, contentType, v1::DEFAULT_CREDENTIAL);
+
+  // Wait until the agent's resources have been updated to include the
+  // resource provider resources.
+  AWAIT_READY(updateSlaveMessage);
+
+  v1Response = post(slave.get()->pid, v1Call, contentType);
+
+  AWAIT_READY(v1Response);
+  ASSERT_TRUE(v1Response->IsInitialized());
+  ASSERT_EQ(v1::agent::Response::GET_RESOURCE_PROVIDERS, v1Response->type());
+
+  EXPECT_EQ(1, v1Response->get_resource_providers().resource_providers_size());
+
+  const mesos::v1::ResourceProviderInfo& responseInfo =
+    v1Response->get_resource_providers()
+      .resource_providers(0)
+      .resource_provider_info();
+
+  EXPECT_EQ(info.type(), responseInfo.type());
+  EXPECT_EQ(info.name(), responseInfo.name());
 }
 
 
@@ -6084,7 +6259,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
   ASSERT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   // Launch the child container with TTY and then attach to it's output.
@@ -6334,7 +6509,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   EXPECT_EQ(1u, containerIds->size());
 
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->set_value(containerIds->begin()->value());
 
   ContentType messageContentType = GetParam();

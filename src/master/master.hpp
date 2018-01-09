@@ -116,19 +116,17 @@ struct Role;
 
 struct Slave
 {
-  Slave(Master* const _master,
-        SlaveInfo _info,
+Slave(Master* const _master,
+      SlaveInfo _info,
         const process::UPID& _pid,
         const MachineID& _machineId,
         const std::string& _version,
-        const std::vector<SlaveInfo::Capability>& _capabilites,
+        std::vector<SlaveInfo::Capability> _capabilites,
         const process::Time& _registeredTime,
         std::vector<Resource> _checkpointedResources,
-        const hashmap<Option<ResourceProviderID>, UUID>& _resourceVersions,
-        const std::vector<ExecutorInfo>& executorInfos =
-          std::vector<ExecutorInfo>(),
-        const std::vector<Task>& tasks =
-          std::vector<Task>());
+        const Option<id::UUID>& resourceVersion,
+        std::vector<ExecutorInfo> executorInfos = std::vector<ExecutorInfo>(),
+        std::vector<Task> tasks = std::vector<Task>());
 
   ~Slave();
 
@@ -148,13 +146,13 @@ struct Slave
 
   void removeTask(Task* task);
 
-  void addOfferOperation(OfferOperation* operation);
+  void addOperation(Operation* operation);
 
-  void recoverResources(OfferOperation* operation);
+  void recoverResources(Operation* operation);
 
-  void removeOfferOperation(OfferOperation* operation);
+  void removeOperation(Operation* operation);
 
-  OfferOperation* getOfferOperation(const UUID& uuid) const;
+  Operation* getOperation(const id::UUID& uuid) const;
 
   void addOffer(Offer* offer);
 
@@ -178,9 +176,16 @@ struct Slave
 
   void apply(const std::vector<ResourceConversion>& conversions);
 
+  Try<Nothing> update(
+      const SlaveInfo& info,
+      const std::string& _version,
+      const std::vector<SlaveInfo::Capability>& _capabilites,
+      const Resources& _checkpointedResources,
+      const Option<id::UUID>& resourceVersion);
+
   Master* const master;
   const SlaveID id;
-  const SlaveInfo info;
+  SlaveInfo info;
 
   const MachineID machineId;
 
@@ -240,7 +245,7 @@ struct Slave
 
   // Pending operations or terminal operations that have
   // unacknowledged status updates on this agent.
-  hashmap<UUID, OfferOperation*> offerOperations;
+  hashmap<id::UUID, Operation*> operations;
 
   // Active offers on this slave.
   hashset<Offer*> offers;
@@ -248,7 +253,7 @@ struct Slave
   // Active inverse offers on this slave.
   hashset<InverseOffer*> inverseOffers;
 
-  // Resources for active task / executors / offer operations.
+  // Resources for active task / executors / operations.
   // Note that we maintain multiple copies of each shared resource in
   // `usedResources` as they are used by multiple tasks.
   hashmap<FrameworkID, Resources> usedResources;
@@ -259,17 +264,22 @@ struct Slave
   // persistent volumes, dynamic reservations, etc). These are either
   // in use by a task/executor, or are available for use and will be
   // re-offered to the framework.
+  // TODO(jieyu): `checkpointedResources` is only for agent default
+  // resources. Resources from resource providers are not included in
+  // this field. Consider removing this field.
   Resources checkpointedResources;
 
   // The current total resources of the slave. Note that this is
   // different from 'info.resources()' because this also considers
   // operations (e.g., CREATE, RESERVE) that have been applied and
-  // includes revocable resources as well.
+  // includes revocable resources and resources from resource
+  // providers as well.
   Resources totalResources;
 
   SlaveObserver* observer;
 
-  hashmap<Option<ResourceProviderID>, UUID> resourceVersions;
+  hashmap<Option<ResourceProviderID>, id::UUID> resourceVersions;
+  hashmap<ResourceProviderID, ResourceProviderInfo> resourceProviders;
 
 private:
   Slave(const Slave&);              // No copying.
@@ -290,7 +300,7 @@ struct HttpConnection
 {
   HttpConnection(const process::http::Pipe::Writer& _writer,
                  ContentType _contentType,
-                 UUID _streamId)
+                 id::UUID _streamId)
     : writer(_writer),
       contentType(_contentType),
       streamId(_streamId) {}
@@ -318,7 +328,7 @@ struct HttpConnection
 
   process::http::Pipe::Writer writer;
   ContentType contentType;
-  UUID streamId;
+  id::UUID streamId;
 };
 
 
@@ -461,23 +471,11 @@ public:
 
   void registerSlave(
       const process::UPID& from,
-      const SlaveInfo& slaveInfo,
-      const std::vector<Resource>& checkpointedResources,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions);
+      RegisterSlaveMessage&& registerSlaveMessage);
 
   void reregisterSlave(
       const process::UPID& from,
-      const SlaveInfo& slaveInfo,
-      const std::vector<Resource>& checkpointedResources,
-      const std::vector<ExecutorInfo>& executorInfos,
-      const std::vector<Task>& tasks,
-      const std::vector<FrameworkInfo>& frameworks,
-      const std::vector<Archive::Framework>& completedFrameworks,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions);
+      ReregisterSlaveMessage&& incomingMessage);
 
   void unregisterSlave(
       const process::UPID& from,
@@ -492,8 +490,8 @@ public:
       const FrameworkID& frameworkId,
       const std::vector<TaskStatus>& statuses);
 
-  void offerOperationStatusUpdate(
-      const OfferOperationStatusUpdate& update);
+  void updateOperationStatus(
+      const UpdateOperationStatusMessage& update);
 
   void exitedExecutor(
       const process::UPID& from,
@@ -502,7 +500,7 @@ public:
       const ExecutorID& executorId,
       int32_t status);
 
-  void updateSlave(const UpdateSlaveMessage& message);
+  void updateSlave(UpdateSlaveMessage&& message);
 
   void updateUnavailability(
       const MachineID& machineId,
@@ -551,18 +549,18 @@ public:
   }
 
 protected:
-  virtual void initialize();
-  virtual void finalize();
+  void initialize() override;
+  void finalize() override;
 
-  virtual void visit(const process::MessageEvent& event);
-  virtual void visit(const process::ExitedEvent& event);
+  void consume(process::MessageEvent&& event) override;
+  void consume(process::ExitedEvent&& event) override;
 
-  virtual void exited(const process::UPID& pid);
+  void exited(const process::UPID& pid) override;
   void exited(const FrameworkID& frameworkId, const HttpConnection& http);
   void _exited(Framework* framework);
 
   // Invoked upon noticing a subscriber disconnection.
-  void exited(const UUID& id);
+  void exited(const id::UUID& id);
 
   void agentReregisterTimeout(const SlaveID& slaveId);
   Nothing _agentReregisterTimeout(const SlaveID& slaveId);
@@ -572,12 +570,12 @@ protected:
   // 'principal' being None indicates it is throttled by
   // 'defaultLimiter'.
   void throttled(
-      const process::MessageEvent& event,
+      process::MessageEvent&& event,
       const Option<std::string>& principal);
 
-  // Continuations of visit().
-  void _visit(const process::MessageEvent& event);
-  void _visit(const process::ExitedEvent& event);
+  // Continuations of consume().
+  void _consume(process::MessageEvent&& event);
+  void _consume(process::ExitedEvent&& event);
 
   // Helper method invoked when the capacity for a framework
   // principal is exceeded.
@@ -591,52 +589,33 @@ protected:
   void recoveredSlavesTimeout(const Registry& registry);
 
   void _registerSlave(
-      const SlaveInfo& slaveInfo,
       const process::UPID& pid,
+      RegisterSlaveMessage&& registerSlaveMessage,
       const Option<std::string>& principal,
-      const std::vector<Resource>& checkpointedResources,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions,
       const process::Future<bool>& authorized);
 
   void __registerSlave(
-      const SlaveInfo& slaveInfo,
       const process::UPID& pid,
-      const std::vector<Resource>& checkpointedResources,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions,
+      RegisterSlaveMessage&& registerSlaveMessage,
       const process::Future<bool>& admit);
 
   void _reregisterSlave(
-      const SlaveInfo& slaveInfo,
       const process::UPID& pid,
+      ReregisterSlaveMessage&& incomingMessage,
       const Option<std::string>& principal,
-      const std::vector<Resource>& checkpointedResources,
-      const std::vector<ExecutorInfo>& executorInfos,
-      const std::vector<Task>& tasks,
-      const std::vector<FrameworkInfo>& frameworks,
-      const std::vector<Archive::Framework>& completedFrameworks,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions,
       const process::Future<bool>& authorized);
 
   void __reregisterSlave(
-      const SlaveInfo& slaveInfo,
       const process::UPID& pid,
-      const std::vector<Resource>& checkpointedResources,
-      const std::vector<ExecutorInfo>& executorInfos,
-      const std::vector<Task>& tasks,
-      const std::vector<FrameworkInfo>& frameworks,
-      const std::vector<Archive::Framework>& completedFrameworks,
-      const std::string& version,
-      const std::vector<SlaveInfo::Capability>& agentCapabilities,
-      const std::vector<ResourceVersionUUID>& resourceVersions,
+      ReregisterSlaveMessage&& incomingMessage,
       const process::Future<bool>& readmit);
 
   void ___reregisterSlave(
+      const process::UPID& pid,
+      ReregisterSlaveMessage&& incomingMessage,
+      const process::Future<bool>& updated);
+
+  void updateSlaveFrameworks(
       Slave* slave,
       const std::vector<FrameworkInfo>& frameworks);
 
@@ -725,8 +704,7 @@ protected:
   // Add a slave.
   void addSlave(
       Slave* slave,
-      const std::vector<Archive::Framework>& completedFrameworks =
-        std::vector<Archive::Framework>());
+      std::vector<Archive::Framework>&& completedFrameworks);
 
   void _markUnreachable(
       Slave* slave,
@@ -784,7 +762,7 @@ protected:
       Framework* framework);
 
   /**
-   * Authorizes a `RESERVE` offer operation.
+   * Authorizes a `RESERVE` operation.
    *
    * Returns whether the Reserve operation is authorized with the
    * provided principal. This function is used for authorization of
@@ -805,7 +783,7 @@ protected:
       const Option<process::http::authentication::Principal>& principal);
 
   /**
-   * Authorizes an `UNRESERVE` offer operation.
+   * Authorizes an `UNRESERVE` operation.
    *
    * Returns whether the Unreserve operation is authorized with the
    * provided principal. This function is used for authorization of
@@ -826,7 +804,7 @@ protected:
       const Option<process::http::authentication::Principal>& principal);
 
   /**
-   * Authorizes a `CREATE` offer operation.
+   * Authorizes a `CREATE` operation.
    *
    * Returns whether the Create operation is authorized with the provided
    * principal. This function is used for authorization of operations
@@ -847,7 +825,7 @@ protected:
       const Option<process::http::authentication::Principal>& principal);
 
   /**
-   * Authorizes a `DESTROY` offer operation.
+   * Authorizes a `DESTROY` operation.
    *
    * Returns whether the Destroy operation is authorized with the provided
    * principal. This function is used for authorization of operations
@@ -889,20 +867,20 @@ protected:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
 
-  // Adds the given offer operation to the framework and the agent.
-  void addOfferOperation(
+  // Adds the given operation to the framework and the agent.
+  void addOperation(
       Framework* framework,
       Slave* slave,
-      OfferOperation* operation);
+      Operation* operation);
 
-  // Transitions the offer operation, and recovers resources if the
-  // offer operation becomes terminal.
-  void updateOfferOperation(
-      OfferOperation* operation,
-      const OfferOperationStatusUpdate& update);
+  // Transitions the operation, and recovers resources if the
+  // operation becomes terminal.
+  void updateOperation(
+      Operation* operation,
+      const UpdateOperationStatusMessage& update);
 
-  // Remove the offer operation.
-  void removeOfferOperation(OfferOperation* operation);
+  // Remove the operation.
+  void removeOperation(Operation* operation);
 
   // Attempts to update the allocator by applying the given operation.
   // If successful, updates the slave's resources, sends a
@@ -943,14 +921,14 @@ protected:
 
 private:
   // Updates the agent's resources by applying the given operation.
-  // Sends either `ApplyOfferOperationMessage` or
+  // Sends either `ApplyOperationMessage` or
   // `CheckpointResourcesMessage` (with updated checkpointed
   // resources) to the agent depending on if the agent has
   // `RESOURCE_PROVIDER` capability.
   void _apply(
       Slave* slave,
       Framework* framework,
-      const Offer::Operation& operation);
+      const Offer::Operation& operationInfo);
 
   void drop(
       const process::UPID& from,
@@ -1050,17 +1028,17 @@ private:
       Framework* framework,
       const scheduler::Call::Acknowledge& acknowledge);
 
-  void acknowledgeOfferOperationUpdate(
+  void acknowledgeOperationStatus(
       Framework* framework,
-      const scheduler::Call::AcknowledgeOfferOperationUpdate& acknowledge);
+      const scheduler::Call::AcknowledgeOperationStatus& acknowledge);
 
   void reconcile(
       Framework* framework,
       const scheduler::Call::Reconcile& reconcile);
 
-  void reconcileOfferOperations(
+  void reconcileOperations(
       Framework* framework,
-      const scheduler::Call::ReconcileOfferOperations& reconcile);
+      const scheduler::Call::ReconcileOperations& reconcile);
 
   void message(
       Framework* framework,
@@ -2038,7 +2016,7 @@ private:
 
     // Active subscribers to the 'api/vX' endpoint keyed by the stream
     // identifier.
-    hashmap<UUID, process::Owned<Subscriber>> subscribed;
+    hashmap<id::UUID, process::Owned<Subscriber>> subscribed;
   } subscribers;
 
   hashmap<OfferID, Offer*> offers;
@@ -2323,14 +2301,14 @@ struct Framework
     }
   }
 
-  void addCompletedTask(const Task& task)
+  void addCompletedTask(Task&& task)
   {
     // TODO(neilc): We currently allow frameworks to reuse the task
     // IDs of completed tasks (although this is discouraged). This
     // means that there might be multiple completed tasks with the
     // same task ID. We should consider rejecting attempts to reuse
     // task IDs (MESOS-6779).
-    completedTasks.push_back(process::Owned<Task>(new Task(task)));
+    completedTasks.push_back(process::Owned<Task>(new Task(std::move(task))));
   }
 
   void addUnreachableTask(const Task& task)
@@ -2358,7 +2336,7 @@ struct Framework
         << task->state();
       addUnreachableTask(*task);
     } else {
-      addCompletedTask(*task);
+      addCompletedTask(Task(*task));
     }
 
     tasks.erase(task->task_id());
@@ -2479,24 +2457,24 @@ struct Framework
     }
   }
 
-  void addOfferOperation(OfferOperation* operation)
+  void addOperation(Operation* operation)
   {
     CHECK(operation->has_framework_id());
 
     const FrameworkID& frameworkId = operation->framework_id();
 
-    Try<UUID> uuid = UUID::fromBytes(operation->operation_uuid());
+    Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
     CHECK_SOME(uuid);
 
-    CHECK(!offerOperations.contains(uuid.get()))
-      << "Duplicate offer operation '" << operation->info().id()
+    CHECK(!operations.contains(uuid.get()))
+      << "Duplicate operation '" << operation->info().id()
       << "' (uuid: " << uuid->toString() << ") "
       << "of framework " << frameworkId;
 
-    offerOperations.put(uuid.get(), operation);
+    operations.put(uuid.get(), operation);
 
     if (operation->info().has_id()) {
-      offerOperationUUIDs.put(operation->info().id(), uuid.get());
+      operationUUIDs.put(operation->info().id(), uuid.get());
     }
 
     if (!protobuf::isSpeculativeOperation(operation->info()) &&
@@ -2514,9 +2492,9 @@ struct Framework
       usedResources[slaveId] += consumed.get();
 
       // It's possible that we're not tracking the role from the
-      // resources in the offer operation for this framework if the
-      // role is absent from the framework's set of roles. In this
-      // case, we track the role's allocation for this framework.
+      // resources in the operation for this framework if the role is
+      // absent from the framework's set of roles. In this case, we
+      // track the role's allocation for this framework.
       foreachkey (const std::string& role, consumed->allocations()) {
         if (!isTrackedUnderRole(role)) {
           trackUnderRole(role);
@@ -2525,7 +2503,7 @@ struct Framework
     }
   }
 
-  void recoverResources(OfferOperation* operation)
+  void recoverResources(Operation* operation)
   {
     CHECK(operation->has_slave_id())
       << "External resource provider is not supported yet";
@@ -2570,13 +2548,13 @@ struct Framework
     }
   }
 
-  void removeOfferOperation(OfferOperation* operation)
+  void removeOperation(Operation* operation)
   {
-    Try<UUID> uuid = UUID::fromBytes(operation->operation_uuid());
+    Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
     CHECK_SOME(uuid);
 
-    CHECK(offerOperations.contains(uuid.get()))
-      << "Unknown offer operation '" << operation->info().id()
+    CHECK(operations.contains(uuid.get()))
+      << "Unknown operation '" << operation->info().id()
       << "' (uuid: " << uuid->toString() << ") "
       << "of framework " << operation->framework_id();
 
@@ -2585,7 +2563,7 @@ struct Framework
       recoverResources(operation);
     }
 
-    offerOperations.erase(uuid.get());
+    operations.erase(uuid.get());
   }
 
   const FrameworkID id() const { return info.id(); }
@@ -2842,11 +2820,11 @@ struct Framework
 
   // Pending operations or terminal operations that have
   // unacknowledged status updates.
-  hashmap<UUID, OfferOperation*> offerOperations;
+  hashmap<id::UUID, Operation*> operations;
 
   // The map from the framework-specified operation ID to the
   // corresponding internal operation UUID.
-  hashmap<OfferOperationID, UUID> offerOperationUUIDs;
+  hashmap<OperationID, id::UUID> operationUUIDs;
 
   // NOTE: For the used and offered resources below, we keep the
   // total as well as partitioned by SlaveID.
@@ -2870,7 +2848,7 @@ struct Framework
   // TODO(mpark): Strip the non-scalar resources out of the totals
   // in order to avoid reporting incorrect statistics (MESOS-2623).
 
-  // Active task / executor / offer operation resources.
+  // Active task / executor / operation resources.
   Resources totalUsedResources;
 
   // Note that we maintain multiple copies of each shared resource in

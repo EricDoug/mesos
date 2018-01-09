@@ -94,6 +94,7 @@ set(MESOS_TESTS_SRC
   fetcher_tests.cpp
   files_tests.cpp
   gc_tests.cpp
+  hdfs_tests.cpp
   health_check_tests.cpp
   hierarchical_allocator_tests.cpp
   hook_tests.cpp
@@ -101,6 +102,7 @@ set(MESOS_TESTS_SRC
   http_fault_tolerance_tests.cpp
   master_maintenance_tests.cpp
   master_slave_reconciliation_tests.cpp
+  operation_status_update_manager_tests.cpp
   partition_tests.cpp
   paths_tests.cpp
   protobuf_io_tests.cpp
@@ -115,6 +117,7 @@ set(MESOS_TESTS_SRC
   scheduler_http_api_tests.cpp
   scheduler_tests.cpp
   slave_authorization_tests.cpp
+  slave_compatibility_tests.cpp
   slave_tests.cpp
   slave_validation_tests.cpp
   sorter_tests.cpp
@@ -156,7 +159,6 @@ if (NOT WIN32)
     dynamic_weights_tests.cpp
     examples_tests.cpp
     fetcher_cache_tests.cpp
-    hdfs_tests.cpp
     log_tests.cpp
     logging_tests.cpp
     master_allocator_tests.cpp
@@ -263,16 +265,7 @@ add_executable(test-helper EXCLUDE_FROM_ALL ${TEST_HELPER_SRC})
 target_link_libraries(test-helper PRIVATE mesos-tests-interface)
 
 # The tests require these binaries.
-add_dependencies(
-  mesos-tests
-  test-helper
-  mesos-agent
-  mesos-default-executor
-  mesos-docker-executor
-  mesos-executor
-  mesos-containerizer
-  mesos-tcp-connect
-  mesos-usage)
+add_dependencies(mesos-tests test-helper mesos-agent)
 
 if (NOT WIN32)
   # The tests require these binaries.
@@ -280,13 +273,10 @@ if (NOT WIN32)
   add_dependencies(
     mesos-tests
     mesos-execute
-    mesos-fetcher
-    mesos-log
     mesos-local
-    mesos-master
-    mesos-io-switchboard
-    mesos-cni-port-mapper
-    mesos-logrotate-logger)
+    mesos-log
+    mesos-logrotate-logger
+    mesos-master)
 
   # The tests require all the test modules. These are not directly linked but
   # instead loaded at runtime, hence the manual dependency here.

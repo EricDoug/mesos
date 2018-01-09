@@ -244,6 +244,12 @@ endif
 PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir)
 if ENABLE_GRPC
 PROTOCFLAGS += -I../$(CSI)
+
+# TODO(josephw): This is a temporary include directory which points to the
+# generated CSI protocol buffer code. Derivative protocol buffers need
+# this include in order to build. When the 3rdparty CSI repo builds its own
+# generated code, this can be changed to include that directory instead.
+MESOS_CPPFLAGS += -I../include/csi
 endif
 
 # README: we build the Mesos library out of a collection of
@@ -376,11 +382,17 @@ CXX_PROTOS +=								\
   slave/containerizer/mesos/isolators/network/cni/spec.pb.h
 
 if ENABLE_GRPC
+CXX_PROTOS +=								\
+  resource_provider/storage/volume_profile.pb.cc			\
+  resource_provider/storage/volume_profile.pb.h
+
 CXX_CSI_PROTOS =							\
-  csi/csi.grpc.pb.cc							\
-  csi/csi.grpc.pb.h							\
-  csi/csi.pb.cc								\
-  csi/csi.pb.h
+  ../include/csi/csi.grpc.pb.cc						\
+  ../include/csi/csi.grpc.pb.h						\
+  ../include/csi/csi.pb.cc						\
+  ../include/csi/csi.pb.h						\
+  csi/state.pb.cc							\
+  csi/state.pb.h
 endif
 
 CXX_LOG_PROTOS =							\
@@ -446,14 +458,14 @@ CLEANFILES +=								\
 ../include/mesos/%.pb.cc ../include/mesos/%.pb.h: $(top_srcdir)/include/mesos/%.proto
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
 
-csi/%.pb.cc csi/%.pb.h: ../$(CSI)/%.proto
-	$(PROTOC) $(PROTOCFLAGS) --cpp_out=csi $^
+../include/csi/%.pb.cc ../include/csi/%.pb.h: ../$(CSI)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include/csi $^
 
 %.pb.cc %.pb.h: %.proto
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=. $^
 
-csi/%.grpc.pb.cc csi/%.grpc.pb.h: ../$(CSI)/%.proto
-	$(PROTOC) $(PROTOCFLAGS) --grpc_out=csi $^		\
+../include/csi/%.grpc.pb.cc ../include/csi/%.grpc.pb.h: ../$(CSI)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --grpc_out=../include/csi $^		\
 	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN)
 
 # Targets for generating Java protocol buffer code.
@@ -734,6 +746,11 @@ module_HEADERS =							\
   $(top_srcdir)/include/mesos/module/secret_generator.hpp		\
   $(top_srcdir)/include/mesos/module/secret_resolver.hpp
 
+if ENABLE_GRPC
+module_HEADERS +=							\
+  $(top_srcdir)/include/mesos/module/volume_profile.hpp
+endif
+
 nodist_module_HEADERS =							\
   ../include/mesos/module/hook.pb.h					\
   ../include/mesos/module/module.pb.h
@@ -761,6 +778,11 @@ resourceproviderdir = $(pkgincludedir)/resource_provider
 resourceprovider_HEADERS =						\
   $(top_srcdir)/include/mesos/resource_provider/resource_provider.hpp	\
   $(top_srcdir)/include/mesos/resource_provider/resource_provider.proto
+
+if ENABLE_GRPC
+resourceprovider_HEADERS +=						\
+  $(top_srcdir)/include/mesos/resource_provider/storage/volume_profile.hpp
+endif
 
 nodist_resourceprovider_HEADERS =					\
   ../include/mesos/resource_provider/resource_provider.pb.h
@@ -1015,6 +1037,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   sched/sched.cpp							\
   scheduler/scheduler.cpp						\
   secret/resolver.cpp							\
+  slave/compatibility.cpp						\
   slave/constants.cpp							\
   slave/container_daemon.cpp						\
   slave/container_logger.cpp						\
@@ -1069,6 +1092,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/containerizer/mesos/provisioner/docker/registry_puller.cpp	\
   slave/containerizer/mesos/provisioner/docker/store.cpp		\
   slave/resource_estimators/noop.cpp					\
+  status_update_manager/operation.cpp					\
   uri/fetcher.cpp							\
   uri/utils.cpp								\
   uri/fetchers/copy.cpp							\
@@ -1163,6 +1187,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   sched/flags.hpp							\
   scheduler/constants.hpp						\
   scheduler/flags.hpp							\
+  slave/compatibility.hpp						\
   slave/constants.hpp							\
   slave/container_daemon.hpp						\
   slave/flags.hpp							\
@@ -1226,6 +1251,8 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/containerizer/mesos/provisioner/docker/store.hpp		\
   slave/qos_controllers/noop.hpp					\
   slave/resource_estimators/noop.hpp					\
+  status_update_manager/status_update_manager_process.hpp		\
+  status_update_manager/operation.hpp					\
   tests/active_user_test_helper.hpp					\
   tests/allocator.hpp							\
   tests/cluster.hpp							\
@@ -1445,6 +1472,12 @@ libmesos_no_3rdparty_la_SOURCES +=					\
 endif
 
 if ENABLE_GRPC
+libmesos_no_3rdparty_la_SOURCES +=					\
+  resource_provider/storage/volume_profile.cpp				\
+  resource_provider/storage/volume_profile.proto			\
+  resource_provider/storage/volume_profile_utils.cpp			\
+  resource_provider/storage/volume_profile_utils.hpp
+
 if OS_LINUX
 libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/storage/provider.cpp				\
@@ -1503,9 +1536,11 @@ libcsi_la_SOURCES =							\
   csi/paths.cpp								\
   csi/utils.cpp
 libcsi_la_SOURCES +=							\
+  ../include/csi/spec.hpp						\
   csi/client.hpp							\
   csi/paths.hpp								\
-  csi/spec.hpp								\
+  csi/state.hpp								\
+  csi/state.proto							\
   csi/utils.hpp
 nodist_libcsi_la_SOURCES = $(CXX_CSI_PROTOS)
 libcsi_la_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -2309,6 +2344,17 @@ libload_qos_controller_la_SOURCES += slave/qos_controllers/load.cpp
 libload_qos_controller_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 libload_qos_controller_la_LDFLAGS = $(MESOS_MODULE_LDFLAGS)
 
+# Library containing the URI volume profile module.
+if ENABLE_GRPC
+pkgmodule_LTLIBRARIES += liburi_volume_profile.la
+liburi_volume_profile_la_SOURCES =				\
+  resource_provider/storage/uri_volume_profile.cpp		\
+  resource_provider/storage/uri_volume_profile.hpp		\
+  resource_provider/storage/volume_profile_utils.hpp
+liburi_volume_profile_la_CPPFLAGS = $(MESOS_CPPFLAGS)
+liburi_volume_profile_la_LDFLAGS = $(MESOS_MODULE_LDFLAGS)
+endif
+
 MESOS_TEST_MODULE_LDFLAGS = $(MESOS_MODULE_LDFLAGS)
 
 # Even if we are not installing the test suite, we still need to build
@@ -2470,6 +2516,7 @@ mesos_tests_SOURCES =						\
   tests/mock_registrar.cpp					\
   tests/module.cpp						\
   tests/module_tests.cpp					\
+  tests/operation_status_update_manager_tests.cpp		\
   tests/oversubscription_tests.cpp				\
   tests/partition_tests.cpp					\
   tests/paths_tests.cpp						\
@@ -2494,6 +2541,7 @@ mesos_tests_SOURCES =						\
   tests/scheduler_tests.cpp					\
   tests/script.cpp						\
   tests/slave_authorization_tests.cpp				\
+  tests/slave_compatibility_tests.cpp				\
   tests/slave_recovery_tests.cpp				\
   tests/slave_validation_tests.cpp				\
   tests/slave_tests.cpp						\
@@ -2609,7 +2657,14 @@ if ENABLE_GRPC
 mesos_tests_SOURCES +=						\
   tests/csi_client_tests.cpp					\
   tests/mock_csi_plugin.cpp					\
-  tests/mock_csi_plugin.hpp
+  tests/mock_csi_plugin.hpp					\
+  tests/volume_profile_tests.cpp
+
+if OS_LINUX
+mesos_tests_SOURCES +=						\
+  tests/agent_resource_provider_config_api_tests.cpp		\
+  tests/storage_local_resource_provider_tests.cpp
+endif
 endif
 
 if ENABLE_SSL

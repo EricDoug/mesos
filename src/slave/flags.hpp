@@ -46,11 +46,15 @@ public:
   bool hostname_lookup;
   Option<std::string> resources;
   Option<std::string> resource_provider_config_dir;
+#ifdef ENABLE_GRPC
+  Option<std::string> volume_profile_adaptor;
+#endif
   std::string isolation;
   std::string launcher;
 
   Option<std::string> image_providers;
   Option<std::string> image_provisioner_backend;
+  Option<ImageGcConfig> image_gc_config;
 
   std::string appc_simple_discovery_uri_prefix;
   std::string appc_store_dir;
@@ -90,6 +94,7 @@ public:
 
   Option<std::string> container_logger;
 
+  std::string reconfiguration_policy;
   std::string recover;
   Duration recovery_timeout;
   bool strict;

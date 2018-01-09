@@ -467,6 +467,47 @@ message ACL {
     // SOME particular operating system users (e.g., linux users).
     required Entity users = 2;
   }
+
+  // Which principals are authorized to see the container metadata of a
+  // standalone container.
+  message ViewStandaloneContainer {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly.
+    // Use Entity type ANY or NONE to allow or deny access.
+    //
+    // TODO(jieyu): Consider allowing granular permission to act upon
+    // SOME particular operating system users (e.g., linux users).
+    required Entity users = 2;
+  }
+
+  // Which principals are authorized to add, update and remove resource
+  // provider config files.
+  message ModifyResourceProviderConfig {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly.
+    // Use Entity type ANY or NONE to allow or deny access.
+    //
+    // TODO(chhsiao): Consider allowing granular permission to act upon
+    // SOME resource provider types and names.
+    required Entity resource_providers = 2;
+  }
+
+  // Which principals are authorized to prune unused container images.
+  message PruneImages {
+    // Subjects: HTTP Username.
+    required Entity principals = 1;
+
+    // Objects: Given implicitly.
+    // Use Entity type ANY or NONE to allow or deny access.
+    //
+    // TODO(zhitao): Consider allowing granular permission to act upon
+    // SOME image reference.
+    required Entity images = 2;
+  }
 }
 
 
@@ -538,8 +579,11 @@ message ACLs {
   repeated ACL.StopMaintenance stop_maintenances = 38;
   repeated ACL.GetMaintenanceStatus get_maintenance_statuses = 39;
   repeated ACL.MarkAgentGone mark_agents_gone = 40;
-  repeated ACL.LaunchStandaloneContainer launch_standalone_container = 41;
-  repeated ACL.KillStandaloneContainer kill_standalone_container = 42;
-  repeated ACL.WaitStandaloneContainer wait_standalone_container = 43;
-  repeated ACL.RemoveStandaloneContainer remove_standalone_container = 44;
+  repeated ACL.LaunchStandaloneContainer launch_standalone_containers = 41;
+  repeated ACL.KillStandaloneContainer kill_standalone_containers = 42;
+  repeated ACL.WaitStandaloneContainer wait_standalone_containers = 43;
+  repeated ACL.RemoveStandaloneContainer remove_standalone_containers = 44;
+  repeated ACL.ViewStandaloneContainer view_standalone_containers = 46;
+  repeated ACL.ModifyResourceProviderConfig modify_resource_provider_configs = 45;
+  repeated ACL.PruneImages prune_images = 47;
 }

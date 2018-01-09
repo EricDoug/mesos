@@ -1280,6 +1280,29 @@ const string& Resources::reservationRole(const Resource& resource)
   return resource.reservations().rbegin()->role();
 }
 
+
+bool Resources::shrink(Resource* resource, const Value::Scalar& target)
+{
+  if (resource->scalar() <= target) {
+    return true; // Already within target.
+  }
+
+  Resource copy = *resource;
+  copy.mutable_scalar()->CopyFrom(target);
+
+  // Some resources (e.g. MOUNT disk) are indivisible. We use
+  // a containement check to verify this. Specifically, if a
+  // contains a smaller version of itself, then it can safely
+  // be chopped into a smaller amount.
+  if (Resources(*resource).contains(copy)) {
+    resource->CopyFrom(copy);
+    return true;
+  }
+
+  return false;
+}
+
+
 /////////////////////////////////////////////////
 // Public member functions.
 /////////////////////////////////////////////////
@@ -2118,17 +2141,27 @@ ostream& operator<<(ostream& stream, const Resource::DiskInfo::Source& source)
 {
   switch (source.type()) {
     case Resource::DiskInfo::Source::MOUNT:
-      return stream << "MOUNT"
-                    << (source.mount().has_root() ? ":" + source.mount().root()
-                                                  : "");
+      return stream
+        << "MOUNT"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "")
+        << (source.mount().has_root() ? ":" + source.mount().root() : "");
     case Resource::DiskInfo::Source::PATH:
-      return stream << "PATH"
-                    << (source.path().has_root() ? ":" + source.path().root()
-                                                 : "");
+      return stream
+        << "PATH"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "")
+        << (source.path().has_root() ? ":" + source.path().root() : "");
     case Resource::DiskInfo::Source::BLOCK:
-      return stream << "BLOCK";
+      return stream
+        << "BLOCK"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "");
     case Resource::DiskInfo::Source::RAW:
-      return stream << "RAW";
+      return stream
+        << "RAW"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "");
     case Resource::DiskInfo::Source::UNKNOWN:
       return stream << "UNKNOWN";
   }

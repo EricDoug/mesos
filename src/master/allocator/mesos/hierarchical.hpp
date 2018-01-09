@@ -144,6 +144,7 @@ public:
 
   void updateSlave(
       const SlaveID& slave,
+      const SlaveInfo& slaveInfo,
       const Option<Resources>& total = None(),
       const Option<std::vector<SlaveInfo::Capability>>& capabilities = None());
 
@@ -381,11 +382,13 @@ protected:
 
     bool activated;  // Whether to offer resources.
 
-    std::string hostname;
+    // The `SlaveInfo` that was passed to the allocator when the slave was added
+    // or updated. Currently only two fields are used: `hostname` for host
+    // whitelisting and in log messages, and `domain` for region-aware
+    // scheduling.
+    SlaveInfo info;
 
     protobuf::slave::Capabilities capabilities;
-
-    Option<DomainInfo> domain;
 
     // Represents a scheduled unavailability due to maintenance for a specific
     // slave, and the responses from frameworks as to whether they will be able
@@ -450,6 +453,14 @@ protected:
   // change in the future.
   hashmap<std::string, Quota> quotas;
 
+  // Aggregated resource reservations on all agents tied to a
+  // particular role, if any. These are stripped scalar quantities
+  // that contain no meta-data. Used for accounting resource
+  // reservations for quota limit.
+  //
+  // Only roles with non-empty reservations will be stored in the map.
+  hashmap<std::string, Resources> reservationScalarQuantities;
+
   // Slaves to send offers for.
   Option<hashset<std::string>> whitelist;
 
@@ -463,9 +474,10 @@ protected:
   Option<DomainInfo> domain;
 
   // There are two stages of allocation. During the first stage resources
-  // are allocated only to frameworks in roles with quota set. During the
-  // second stage remaining resources that would not be required to satisfy
-  // un-allocated quota are then allocated to all frameworks.
+  // are allocated only to frameworks under roles with quota set. During
+  // the second stage remaining resources that would not be required to
+  // satisfy un-allocated quota are then allocated to frameworks under
+  // roles with no quota set.
   //
   // Each stage comprises two levels of sorting, hence "hierarchical".
   // Level 1 sorts across roles:
@@ -495,13 +507,16 @@ protected:
 
   // A sorter for active roles. This sorter determines the order in which
   // roles are allocated resources during Level 1 of the second stage.
+  // The total cluster resources are used as the resource pool.
   process::Owned<Sorter> roleSorter;
 
   // A dedicated sorter for roles for which quota is set. This sorter
   // determines the order in which quota'ed roles are allocated resources
   // during Level 1 of the first stage. Quota'ed roles have resources
-  // allocated up to their alloted quota (the first stage) prior to
-  // non-quota'ed roles (the second stage).
+  // allocated up to their allocated quota (the first stage) prior to
+  // non-quota'ed roles (the second stage). Since only non-revocable
+  // resources are available for quota, the total cluster non-revocable
+  // resoures are used as the resource pool.
   //
   // NOTE: A role appears in `quotaRoleSorter` if it has a quota (even if
   // no frameworks are currently registered in that role). In contrast,
@@ -518,7 +533,9 @@ protected:
   // A collection of sorters, one per active role. Each sorter determines
   // the order in which frameworks that belong to the same role are allocated
   // resources inside the role's share. These sorters are used during Level 2
-  // for both the first and the second stages.
+  // for both the first and the second stages. Since frameworks are sharing
+  // the resources allocated to a role, the role's allocation is used as
+  // the resource pool for each role specific framework sorter.
   hashmap<std::string, process::Owned<Sorter>> frameworkSorters;
 
   // Factory function for framework sorters.
@@ -537,6 +554,26 @@ private:
       const FrameworkID& frameworkId,
       const std::string& role);
 
+  // `trackReservations` and `untrackReservations` are helpers
+  // to track role resource reservations. We need to keep
+  // track of reservations to enforce role quota limit
+  // in the presence of unallocated reservations. See MESOS-4527.
+  //
+  // TODO(mzhu): Ideally, we want these helpers to instead track the
+  // reservations as *allocated* in the sorters even when the
+  // reservations have not been allocated yet. This will help to:
+  //
+  //   (1) Solve the fairness issue when roles with unallocated
+  //       reservations may game the allocator (See MESOS-8299).
+  //
+  //   (2) Simplify the quota enforcement logic -- the allocator
+  //       would no longer need to track reservations separately.
+  void trackReservations(
+      const hashmap<std::string, Resources>& reservations);
+
+  void untrackReservations(
+      const hashmap<std::string, Resources>& reservations);
+
   // Helper to update the agent's total resources maintained in the allocator
   // and the role and quota sorters (whose total resources match the agent's
   // total resources). Returns true iff the stored agent total was changed.
@@ -547,11 +584,21 @@ private:
   // the agent and the master are both configured with a fault domain.
   bool isRemoteSlave(const Slave& slave) const;
 
-  // Helper to track used resources on an agent.
+  // Helper to track allocated resources on an agent.
   void trackAllocatedResources(
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const Resources& allocated);
+
+  // Helper to untrack resources that are no longer allocated on an agent.
+  void untrackAllocatedResources(
+      const SlaveID& slaveId,
+      const FrameworkID& frameworkId,
+      const Resources& allocated);
+
+  // Helper that removes all existing offer filters for the given slave
+  // id.
+  void removeFilters(const SlaveID& slaveId);
 };
 
 

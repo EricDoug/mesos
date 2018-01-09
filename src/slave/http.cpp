@@ -72,6 +72,8 @@
 #include "slave/slave.hpp"
 #include "slave/validation.hpp"
 
+#include "slave/containerizer/mesos/paths.hpp"
+
 #include "version/version.hpp"
 
 using mesos::agent::ProcessIO;
@@ -101,6 +103,7 @@ using process::TLDR;
 
 using process::http::Accepted;
 using process::http::BadRequest;
+using process::http::Conflict;
 using process::http::Connection;
 using process::http::Forbidden;
 using process::http::NotFound;
@@ -577,6 +580,9 @@ Future<Response> Http::_api(
     case mesos::agent::Call::GET_AGENT:
       return getAgent(call, mediaTypes.accept, principal);
 
+    case mesos::agent::Call::GET_RESOURCE_PROVIDERS:
+      return getResourceProviders(call, mediaTypes.accept, principal);
+
     case mesos::agent::Call::LAUNCH_NESTED_CONTAINER:
       return launchNestedContainer(call, mediaTypes.accept, principal);
 
@@ -611,6 +617,18 @@ Future<Response> Http::_api(
 
     case mesos::agent::Call::REMOVE_CONTAINER:
       return removeContainer(call, mediaTypes.accept, principal);
+
+    case mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG:
+      return addResourceProviderConfig(call, principal);
+
+    case mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG:
+      return updateResourceProviderConfig(call, principal);
+
+    case mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG:
+      return removeResourceProviderConfig(call, principal);
+
+    case mesos::agent::Call::PRUNE_IMAGES:
+      return pruneImages(call, mediaTypes.accept, principal);
   }
 
   UNREACHABLE();
@@ -632,7 +650,7 @@ string Http::EXECUTOR_HELP() {
         "",
         "Returns 202 Accepted for all other Call messages iff the",
         "request is accepted."),
-    AUTHENTICATION(false));
+    AUTHENTICATION(true));
 }
 
 
@@ -1335,7 +1353,7 @@ Future<Response> Http::state(
         writer->field("id", slave->info.id().value());
         writer->field("pid", string(slave->self()));
         writer->field("hostname", slave->info.hostname());
-        writer->field("capabilities", AGENT_CAPABILITIES());
+        writer->field("capabilities", slave->capabilities.toRepeatedPtrField());
 
         if (slave->info.has_domain()) {
           writer->field("domain", slave->info.domain());
@@ -1853,6 +1871,36 @@ Future<Response> Http::getAgent(
 }
 
 
+Future<Response> Http::getResourceProviders(
+    const mesos::agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::GET_RESOURCE_PROVIDERS, call.type());
+
+  LOG(INFO) << "Processing GET_RESOURCE_PROVIDERS call";
+
+  // TODO(nfnt): Authorize this call (MESOS-8314).
+
+  agent::Response response;
+  response.set_type(mesos::agent::Response::GET_RESOURCE_PROVIDERS);
+
+  agent::Response::GetResourceProviders* resourceProviders =
+    response.mutable_get_resource_providers();
+
+  foreachvalue (ResourceProvider* resourceProvider,
+                slave->resourceProviders) {
+    agent::Response::GetResourceProviders::ResourceProvider* provider =
+      resourceProviders->add_resource_providers();
+
+    provider->mutable_resource_provider_info()
+      ->CopyFrom(resourceProvider->info);
+  }
+
+  return OK(serialize(acceptType, evolve(response)), stringify(acceptType));
+}
+
+
 Future<Response> Http::getState(
     const mesos::agent::Call& call,
     ContentType acceptType,
@@ -2123,10 +2171,26 @@ Future<Response> Http::getContainers(
     AuthorizationAcceptor::create(
         principal, slave->authorizer, authorization::VIEW_CONTAINER);
 
-  return authorizeContainer.then(defer(slave->self(),
-      [this](const Owned<AuthorizationAcceptor>& authorizeContainer) {
-        // Use an empty container ID filter.
-        return __containers(authorizeContainer, None());
+  Future<Owned<AuthorizationAcceptor>> authorizeStandaloneContainer =
+    AuthorizationAcceptor::create(
+        principal, slave->authorizer, authorization::VIEW_STANDALONE_CONTAINER);
+
+  return collect(authorizeContainer, authorizeStandaloneContainer)
+    .then(defer(
+        slave->self(),
+        [this, call](const tuple<Owned<AuthorizationAcceptor>,
+                                 Owned<AuthorizationAcceptor>>& acceptors) {
+          Owned<AuthorizationAcceptor> authorizeContainer;
+          Owned<AuthorizationAcceptor> authorizeStandaloneContainer;
+          tie(authorizeContainer, authorizeStandaloneContainer) = acceptors;
+
+          // Use an empty container ID filter.
+          return __containers(
+              authorizeContainer,
+              authorizeStandaloneContainer,
+              None(),
+              call.get_containers().show_nested(),
+              call.get_containers().show_standalone());
     })).then([acceptType](const Future<JSON::Array>& result)
         -> Future<Response> {
       if (!result.isReady()) {
@@ -2155,19 +2219,36 @@ Future<Response> Http::_containers(
   Future<Owned<AuthorizationAcceptor>> authorizeContainer =
     AuthorizationAcceptor::create(
         principal, slave->authorizer, authorization::VIEW_CONTAINER);
+
+  Future<Owned<AuthorizationAcceptor>> authorizeStandaloneContainer =
+    AuthorizationAcceptor::create(
+        principal, slave->authorizer, authorization::VIEW_STANDALONE_CONTAINER);
+
   Future<IDAcceptor<ContainerID>> selectContainerId =
       IDAcceptor<ContainerID>(request.url.query.get("container_id"));
 
-  return collect(authorizeContainer, selectContainerId)
+  return collect(authorizeContainer,
+                 authorizeStandaloneContainer,
+                 selectContainerId)
     .then(defer(
         slave->self(),
         [this](const tuple<Owned<AuthorizationAcceptor>,
+                           Owned<AuthorizationAcceptor>,
                            IDAcceptor<ContainerID>>& acceptors) {
           Owned<AuthorizationAcceptor> authorizeContainer;
+          Owned<AuthorizationAcceptor> authorizeStandaloneContainer;
           Option<IDAcceptor<ContainerID>> selectContainerId;
-          tie(authorizeContainer, selectContainerId) = acceptors;
 
-          return __containers(authorizeContainer, selectContainerId);
+          tie(authorizeContainer,
+              authorizeStandaloneContainer,
+              selectContainerId) = acceptors;
+
+          return __containers(
+              authorizeContainer,
+              authorizeStandaloneContainer,
+              selectContainerId,
+              false,
+              false);
     })).then([request](const Future<JSON::Array>& result) -> Future<Response> {
        if (!result.isReady()) {
          LOG(WARNING) << "Could not collect container status and statistics: "
@@ -2188,96 +2269,234 @@ Future<Response> Http::_containers(
 
 Future<JSON::Array> Http::__containers(
     Owned<AuthorizationAcceptor> authorizeContainer,
-    Option<IDAcceptor<ContainerID>> selectContainerId) const
+    Owned<AuthorizationAcceptor> authorizeStandaloneContainer,
+    Option<IDAcceptor<ContainerID>> selectContainerId,
+    bool showNestedContainers,
+    bool showStandaloneContainers) const
 {
-  Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
-  list<Future<ContainerStatus>> statusFutures;
-  list<Future<ResourceStatistics>> statsFutures;
+  return slave->containerizer->containers()
+    .then(defer(slave->self(), [=](const hashset<ContainerID> containerIds) {
+      Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
+      list<Future<ContainerStatus>> statusFutures;
+      list<Future<ResourceStatistics>> statsFutures;
 
-  foreachvalue (const Framework* framework, slave->frameworks) {
-    foreachvalue (const Executor* executor, framework->executors) {
-      // No need to get statistics and status if we know that the
-      // executor has already terminated.
-      if (executor->state == Executor::TERMINATED) {
-        continue;
-      }
+      hashset<ContainerID> executorContainerIds;
+      hashset<ContainerID> authorizedExecutorContainerIds;
 
-      const ExecutorInfo& info = executor->info;
-      const ContainerID& containerId = executor->containerId;
-
-      if ((selectContainerId.isSome() &&
-           !selectContainerId->accept(containerId)) ||
-          !authorizeContainer->accept(info, framework->info)) {
-        continue;
-      }
-
-      JSON::Object entry;
-      entry.values["framework_id"] = info.framework_id().value();
-      entry.values["executor_id"] = info.executor_id().value();
-      entry.values["executor_name"] = info.name();
-      entry.values["source"] = info.source();
-      entry.values["container_id"] = containerId.value();
-
-      metadata->push_back(entry);
-      statusFutures.push_back(slave->containerizer->status(containerId));
-      statsFutures.push_back(slave->containerizer->usage(containerId));
-    }
-  }
-
-  return await(await(statusFutures), await(statsFutures)).then(
-      [metadata](const tuple<
-          Future<list<Future<ContainerStatus>>>,
-          Future<list<Future<ResourceStatistics>>>>& t)
-          -> Future<JSON::Array> {
-        const list<Future<ContainerStatus>>& status = std::get<0>(t).get();
-        const list<Future<ResourceStatistics>>& stats = std::get<1>(t).get();
-        CHECK_EQ(status.size(), stats.size());
-        CHECK_EQ(status.size(), metadata->size());
-
-        JSON::Array result;
-
-        auto statusIter = status.begin();
-        auto statsIter = stats.begin();
-        auto metadataIter = metadata->begin();
-
-        while (statusIter != status.end() &&
-               statsIter != stats.end() &&
-               metadataIter != metadata->end()) {
-          JSON::Object& entry= *metadataIter;
-
-          if (statusIter->isReady()) {
-            entry.values["status"] = JSON::protobuf(statusIter->get());
-          } else {
-            LOG(WARNING) << "Failed to get container status for executor '"
-                         << entry.values["executor_id"] << "'"
-                         << " of framework "
-                         << entry.values["framework_id"] << ": "
-                         << (statusIter->isFailed()
-                              ? statusIter->failure()
-                              : "discarded");
+      foreachvalue (const Framework* framework, slave->frameworks) {
+        foreachvalue (const Executor* executor, framework->executors) {
+          // No need to get statistics and status if we know that the
+          // executor has already terminated.
+          if (executor->state == Executor::TERMINATED) {
+            continue;
           }
 
-          if (statsIter->isReady()) {
-            entry.values["statistics"] = JSON::protobuf(statsIter->get());
-          } else {
-            LOG(WARNING) << "Failed to get resource statistics for executor '"
-                         << entry.values["executor_id"] << "'"
-                         << " of framework "
-                         << entry.values["framework_id"] << ": "
-                         << (statsIter->isFailed()
-                              ? statsIter->failure()
-                              : "discarded");
+          const ExecutorInfo& info = executor->info;
+          const ContainerID& containerId = executor->containerId;
+
+          executorContainerIds.insert(containerId);
+
+          if ((selectContainerId.isSome() &&
+               !selectContainerId->accept(containerId)) ||
+              !authorizeContainer->accept(info, framework->info)) {
+            continue;
           }
 
-          result.values.push_back(entry);
+          authorizedExecutorContainerIds.insert(containerId);
 
-          statusIter++;
-          statsIter++;
-          metadataIter++;
+          JSON::Object entry;
+          entry.values["framework_id"] = info.framework_id().value();
+          entry.values["executor_id"] = info.executor_id().value();
+          entry.values["executor_name"] = info.name();
+          entry.values["source"] = info.source();
+          entry.values["container_id"] = containerId.value();
+
+          metadata->push_back(entry);
+          statusFutures.push_back(slave->containerizer->status(containerId));
+          statsFutures.push_back(slave->containerizer->usage(containerId));
+        }
+      }
+
+      foreach (const ContainerID& containerId, containerIds) {
+        if (executorContainerIds.contains(containerId)) {
+          continue;
         }
 
-        return result;
-      });
+        if (selectContainerId.isSome() &&
+            !selectContainerId->accept(containerId)) {
+          continue;
+        }
+
+        const bool isNestedContainer = containerId.has_parent();
+
+        // TODO(jieyu): Only MesosContainerizer supports standalone
+        // container currently. Thus it's ok to call
+        // MesosContainerizer-specific method here. If we want to
+        // support other Containerizers, we should make this a
+        // Containerizer interface.
+        const bool isStandaloneContainer =
+          containerizer::paths::isStandaloneContainer(
+              slave->flags.runtime_dir,
+              containerId);
+
+        // For nested containers, authorization is always based on
+        // its root container.
+        ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
+
+        const bool isRootContainerStandalone =
+          containerizer::paths::isStandaloneContainer(
+              slave->flags.runtime_dir,
+              rootContainerId);
+
+        if (isNestedContainer && !showNestedContainers) {
+          continue;
+        }
+
+        if (isStandaloneContainer && !showStandaloneContainers) {
+          continue;
+        }
+
+        if (isRootContainerStandalone &&
+            !authorizeStandaloneContainer->accept()) {
+          continue;
+        }
+
+        if (!isRootContainerStandalone &&
+            !authorizedExecutorContainerIds.contains(rootContainerId)) {
+          continue;
+        }
+
+        JSON::Object entry;
+        entry.values["container_id"] = containerId.value();
+
+        metadata->push_back(entry);
+        statusFutures.push_back(slave->containerizer->status(containerId));
+        statsFutures.push_back(slave->containerizer->usage(containerId));
+      }
+
+      return await(await(statusFutures), await(statsFutures)).then(
+          [metadata](const tuple<
+              Future<list<Future<ContainerStatus>>>,
+              Future<list<Future<ResourceStatistics>>>>& t)
+              -> Future<JSON::Array> {
+            const list<Future<ContainerStatus>>& status =
+              std::get<0>(t).get();
+
+            const list<Future<ResourceStatistics>>& stats =
+              std::get<1>(t).get();
+
+            CHECK_EQ(status.size(), stats.size());
+            CHECK_EQ(status.size(), metadata->size());
+
+            JSON::Array result;
+
+            auto statusIter = status.begin();
+            auto statsIter = stats.begin();
+            auto metadataIter = metadata->begin();
+
+            while (statusIter != status.end() &&
+                   statsIter != stats.end() &&
+                   metadataIter != metadata->end()) {
+              JSON::Object& entry = *metadataIter;
+
+              if (statusIter->isReady()) {
+                entry.values["status"] = JSON::protobuf(statusIter->get());
+              } else {
+                LOG(WARNING) << "Failed to get container status for executor '"
+                             << entry.values["executor_id"] << "'"
+                             << " of framework "
+                             << entry.values["framework_id"] << ": "
+                             << (statusIter->isFailed()
+                                  ? statusIter->failure()
+                                  : "discarded");
+              }
+
+              if (statsIter->isReady()) {
+                entry.values["statistics"] = JSON::protobuf(statsIter->get());
+              } else {
+                LOG(WARNING)
+                  << "Failed to get resource statistics for executor '"
+                  << entry.values["executor_id"] << "'"
+                  << " of framework "
+                  << entry.values["framework_id"] << ": "
+                  << (statsIter->isFailed()
+                      ? statsIter->failure()
+                      : "discarded");
+              }
+
+              result.values.push_back(entry);
+
+              statusIter++;
+              statsIter++;
+              metadataIter++;
+            }
+
+            return result;
+          });
+    }));
+}
+
+
+Future<Response> Http::pruneImages(
+    const agent::Call& call,
+    ContentType acceptType,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(agent::Call::PRUNE_IMAGES, call.type());
+
+  LOG(INFO) << "Processing PRUNE_IMAGES call";
+  vector<Image> excludedImages(call.prune_images().excluded_images().begin(),
+                               call.prune_images().excluded_images().end());
+
+  // Include any `excluded_images` from agent flag's `image_gc_config`
+  // if not empty.
+  if (slave->flags.image_gc_config.isSome()) {
+    std::copy(slave->flags.image_gc_config->excluded_images().begin(),
+              slave->flags.image_gc_config->excluded_images().end(),
+              std::back_inserter(excludedImages));
+  }
+
+  Future<Owned<ObjectApprover>> approver;
+
+  if (slave->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = slave->authorizer.get()->getObjectApprover(
+        subject,
+        authorization::PRUNE_IMAGES);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver
+    .then(defer(slave->self(), [this, excludedImages](
+        const Owned<ObjectApprover>& approver) -> Future<Response> {
+      Try<bool> approved = approver->approved(ObjectApprover::Object());
+      if (approved.isError()) {
+        return InternalServerError("Authorization error: " + approved.error());
+      } else if (!approved.get()) {
+        return Forbidden();
+      }
+
+      return slave->containerizer->pruneImages(excludedImages)
+          .then([](const Future<Nothing>& result) -> Future<Response> {
+            if (!result.isReady()) {
+              // TODO(zhitao): Because `containerizer::pruneImages` returns
+              // a `Nothing` now, we cannot distinguish between actual
+              // failure or the case that operator should drain the agent.
+              // Consider returning more information.
+              LOG(WARNING)
+                << "Failed to prune images: "
+                << (result.isFailed() ? result.failure() : "discarded");
+
+              return result.isFailed()
+                ? InternalServerError(result.failure())
+                : InternalServerError();
+            }
+
+            return OK();
+          });
+    }));
 }
 
 
@@ -3076,6 +3295,173 @@ Future<Response> Http::attachContainerInput(
       return _attachContainerInput(
           call, std::move(decoder_), mediaTypes);
   }));
+}
+
+
+Future<Response> Http::addResourceProviderConfig(
+    const mesos::agent::Call& call,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG, call.type());
+  CHECK(call.has_add_resource_provider_config());
+
+  Future<Owned<ObjectApprover>> approver;
+
+  if (slave->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = slave->authorizer.get()->getObjectApprover(
+        subject,
+        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver
+    .then(defer(slave->self(), [=](
+        const Owned<ObjectApprover>& approver) -> Future<Response> {
+      Try<bool> approved = approver->approved(ObjectApprover::Object());
+      if (approved.isError()) {
+        return InternalServerError("Authorization error: " + approved.error());
+      } else if (!approved.get()) {
+        return Forbidden();
+      }
+
+      const ResourceProviderInfo& info =
+        call.add_resource_provider_config().info();
+
+      LOG(INFO)
+        << "Processing ADD_RESOURCE_PROVIDER_CONFIG call with type '"
+        << info.type() << "' and name '" << info.name() << "'";
+
+      return slave->localResourceProviderDaemon->add(info)
+        .then([](bool added) -> Response {
+          if (!added) {
+            return Conflict();
+          }
+
+          return OK();
+        })
+        .repair([info](const Future<Response>& future) {
+          LOG(ERROR)
+            << "Failed to add resource provider config with type '"
+            << info.type() << "' and name '" << info.name() << "': "
+            << future.failure();
+
+          return InternalServerError(future.failure());
+        });
+    }));
+}
+
+
+Future<Response> Http::updateResourceProviderConfig(
+    const mesos::agent::Call& call,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG, call.type());
+  CHECK(call.has_update_resource_provider_config());
+
+  Future<Owned<ObjectApprover>> approver;
+
+  if (slave->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = slave->authorizer.get()->getObjectApprover(
+        subject,
+        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver
+    .then(defer(slave->self(), [=](
+        const Owned<ObjectApprover>& approver) -> Future<Response> {
+      Try<bool> approved = approver->approved(ObjectApprover::Object());
+      if (approved.isError()) {
+        return InternalServerError("Authorization error: " + approved.error());
+      } else if (!approved.get()) {
+        return Forbidden();
+      }
+
+      const ResourceProviderInfo& info =
+        call.update_resource_provider_config().info();
+
+      LOG(INFO)
+        << "Processing UPDATE_RESOURCE_PROVIDER_CONFIG call with type '"
+        << info.type() << "' and name '" << info.name() << "'";
+
+      return slave->localResourceProviderDaemon->update(info)
+        .then([](bool updated) -> Response {
+          if (!updated) {
+            return NotFound();
+          }
+
+          return OK();
+        })
+        .repair([info](const Future<Response>& future) {
+          LOG(ERROR)
+            << "Failed to update resource provider config with type '"
+            << info.type() << "' and name '" << info.name() << "': "
+            << future.failure();
+
+          return InternalServerError(future.failure());
+        });
+    }));
+}
+
+
+Future<Response> Http::removeResourceProviderConfig(
+    const mesos::agent::Call& call,
+    const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG, call.type());
+  CHECK(call.has_remove_resource_provider_config());
+
+  Future<Owned<ObjectApprover>> approver;
+
+  if (slave->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = slave->authorizer.get()->getObjectApprover(
+        subject,
+        authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver
+    .then(defer(slave->self(), [=](
+        const Owned<ObjectApprover>& approver) -> Future<Response> {
+      Try<bool> approved = approver->approved(ObjectApprover::Object());
+      if (approved.isError()) {
+        return InternalServerError("Authorization error: " + approved.error());
+      } else if (!approved.get()) {
+        return Forbidden();
+      }
+
+      const string& type = call.remove_resource_provider_config().type();
+      const string& name = call.remove_resource_provider_config().name();
+
+      LOG(INFO)
+        << "Processing REMOVE_RESOURCE_PROVIDER_CONFIG call with type '" << type
+        << "' and name '" << name << "'";
+
+      return slave->localResourceProviderDaemon->remove(type, name)
+        .then([](bool removed) -> Response {
+          if (!removed) {
+            return NotFound();
+          }
+
+          return OK();
+        })
+        .repair([type, name](const Future<Response>& future) {
+          LOG(ERROR)
+            << "Failed to remove resource provider config with type '" << type
+            << "' and name '" << name << "': " << future.failure();
+
+          return InternalServerError(future.failure());
+        });
+    }));
 }
 
 

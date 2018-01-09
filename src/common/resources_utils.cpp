@@ -21,6 +21,8 @@
 
 using std::vector;
 
+using google::protobuf::Descriptor;
+using google::protobuf::Message;
 using google::protobuf::RepeatedPtrField;
 
 namespace mesos {
@@ -100,25 +102,25 @@ namespace internal {
 template <typename TResources,
           typename TResource,
           typename TResourceConversion,
-          typename TOfferOperation>
+          typename TOperation>
 Try<vector<TResourceConversion>> getResourceConversions(
-    const TOfferOperation& operation)
+    const TOperation& operation)
 {
   vector<TResourceConversion> conversions;
 
   switch (operation.type()) {
-    case TOfferOperation::UNKNOWN:
-      return Error("Unknown offer operation");
+    case TOperation::UNKNOWN:
+      return Error("Unknown operation");
 
-    case TOfferOperation::LAUNCH:
-    case TOfferOperation::LAUNCH_GROUP:
-    case TOfferOperation::CREATE_VOLUME:
-    case TOfferOperation::DESTROY_VOLUME:
-    case TOfferOperation::CREATE_BLOCK:
-    case TOfferOperation::DESTROY_BLOCK:
-      return Error("Offer operation not supported");
+    case TOperation::LAUNCH:
+    case TOperation::LAUNCH_GROUP:
+    case TOperation::CREATE_VOLUME:
+    case TOperation::DESTROY_VOLUME:
+    case TOperation::CREATE_BLOCK:
+    case TOperation::DESTROY_BLOCK:
+      return Error("Operation not supported");
 
-    case TOfferOperation::RESERVE: {
+    case TOperation::RESERVE: {
       foreach (const TResource& reserved, operation.reserve().resources()) {
         // Note that we only allow "pushing" a single reservation at time.
         TResources consumed = TResources(reserved).popReservation();
@@ -127,7 +129,7 @@ Try<vector<TResourceConversion>> getResourceConversions(
       break;
     }
 
-    case TOfferOperation::UNRESERVE: {
+    case TOperation::UNRESERVE: {
       foreach (const TResource& reserved, operation.unreserve().resources()) {
         // Note that we only allow "popping" a single reservation at time.
         TResources converted = TResources(reserved).popReservation();
@@ -136,7 +138,7 @@ Try<vector<TResourceConversion>> getResourceConversions(
       break;
     }
 
-    case TOfferOperation::CREATE: {
+    case TOperation::CREATE: {
       foreach (const TResource& volume, operation.create().volumes()) {
         // Strip persistence and volume from the disk info so that we
         // can subtract it from the original resources.
@@ -162,7 +164,7 @@ Try<vector<TResourceConversion>> getResourceConversions(
       break;
     }
 
-    case TOfferOperation::DESTROY: {
+    case TOperation::DESTROY: {
       foreach (const TResource& volume, operation.destroy().volumes()) {
         // Strip persistence and volume from the disk info so that we
         // can subtract it from the original resources.
@@ -234,15 +236,27 @@ Result<ResourceProviderID> getResourceProviderId(
     case Offer::Operation::LAUNCH_GROUP:
       return Error("Unexpected LAUNCH_GROUP operation");
     case Offer::Operation::RESERVE:
+      if (operation.reserve().resources().empty()) {
+        return Error("Operation contains no resources");
+      }
       resource = operation.reserve().resources(0);
       break;
     case Offer::Operation::UNRESERVE:
+      if (operation.unreserve().resources().empty()) {
+        return Error("Operation contains no resources");
+      }
       resource = operation.unreserve().resources(0);
       break;
     case Offer::Operation::CREATE:
+      if (operation.create().volumes().empty()) {
+        return Error("Operation contains no resources");
+      }
       resource = operation.create().volumes(0);
       break;
     case Offer::Operation::DESTROY:
+      if (operation.destroy().volumes().empty()) {
+        return Error("Operation contains no resources");
+      }
       resource = operation.destroy().volumes(0);
       break;
     case Offer::Operation::CREATE_VOLUME:
@@ -376,7 +390,116 @@ void convertResourceFormat(
 }
 
 
-Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
+void upgradeResources(Offer::Operation* operation)
+{
+  CHECK_NOTNULL(operation);
+
+  switch (operation->type()) {
+    case Offer::Operation::RESERVE: {
+      convertResourceFormat(
+          operation->mutable_reserve()->mutable_resources(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::UNRESERVE: {
+      convertResourceFormat(
+          operation->mutable_unreserve()->mutable_resources(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::CREATE: {
+      convertResourceFormat(
+          operation->mutable_create()->mutable_volumes(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::DESTROY: {
+      convertResourceFormat(
+          operation->mutable_destroy()->mutable_volumes(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::LAUNCH: {
+      foreach (
+          TaskInfo& task, *operation->mutable_launch()->mutable_task_infos()) {
+        convertResourceFormat(
+            task.mutable_resources(),
+            POST_RESERVATION_REFINEMENT);
+
+        if (task.has_executor()) {
+          convertResourceFormat(
+              task.mutable_executor()->mutable_resources(),
+              POST_RESERVATION_REFINEMENT);
+        }
+      }
+
+      return;
+    }
+    case Offer::Operation::LAUNCH_GROUP: {
+      Offer::Operation::LaunchGroup* launchGroup =
+        operation->mutable_launch_group();
+
+      if (launchGroup->has_executor()) {
+        convertResourceFormat(
+            launchGroup->mutable_executor()->mutable_resources(),
+            POST_RESERVATION_REFINEMENT);
+      }
+
+      foreach (
+          TaskInfo& task, *launchGroup->mutable_task_group()->mutable_tasks()) {
+        convertResourceFormat(
+            task.mutable_resources(), POST_RESERVATION_REFINEMENT);
+
+        if (task.has_executor()) {
+          convertResourceFormat(
+              task.mutable_executor()->mutable_resources(),
+              POST_RESERVATION_REFINEMENT);
+        }
+      }
+
+      return;
+    }
+    case Offer::Operation::CREATE_VOLUME: {
+      convertResourceFormat(
+          operation->mutable_create_volume()->mutable_source(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::DESTROY_VOLUME: {
+      convertResourceFormat(
+          operation->mutable_destroy_volume()->mutable_volume(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::CREATE_BLOCK: {
+      convertResourceFormat(
+          operation->mutable_create_block()->mutable_source(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::DESTROY_BLOCK: {
+      convertResourceFormat(
+          operation->mutable_destroy_block()->mutable_block(),
+          POST_RESERVATION_REFINEMENT);
+
+      return;
+    }
+    case Offer::Operation::UNKNOWN: {
+      return;
+    }
+  }
+  UNREACHABLE();
+}
+
+
+Option<Error> validateAndUpgradeResources(Offer::Operation* operation)
 {
   CHECK_NOTNULL(operation);
 
@@ -398,11 +521,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         return error;
       }
 
-      convertResourceFormat(
-          operation->mutable_reserve()->mutable_resources(),
-          POST_RESERVATION_REFINEMENT);
-
-      return None();
+      break;
     }
     case Offer::Operation::UNRESERVE: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -421,11 +540,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         return error;
       }
 
-      convertResourceFormat(
-          operation->mutable_unreserve()->mutable_resources(),
-          POST_RESERVATION_REFINEMENT);
-
-      return None();
+      break;
     }
     case Offer::Operation::CREATE: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -444,11 +559,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         return error;
       }
 
-      convertResourceFormat(
-          operation->mutable_create()->mutable_volumes(),
-          POST_RESERVATION_REFINEMENT);
-
-      return None();
+      break;
     }
     case Offer::Operation::DESTROY: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -467,11 +578,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         return error;
       }
 
-      convertResourceFormat(
-          operation->mutable_destroy()->mutable_volumes(),
-          POST_RESERVATION_REFINEMENT);
-
-      return None();
+      break;
     }
     case Offer::Operation::LAUNCH: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -500,21 +607,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         }
       }
 
-      // Normalize resources in LAUNCH.
-      foreach (
-          TaskInfo& task, *operation->mutable_launch()->mutable_task_infos()) {
-        convertResourceFormat(
-            task.mutable_resources(),
-            POST_RESERVATION_REFINEMENT);
-
-        if (task.has_executor()) {
-          convertResourceFormat(
-              task.mutable_executor()->mutable_resources(),
-              POST_RESERVATION_REFINEMENT);
-        }
-      }
-
-      return None();
+      break;
     }
     case Offer::Operation::LAUNCH_GROUP: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -555,27 +648,7 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
         }
       }
 
-      // Normalize resources in LAUNCH_GROUP.
-      if (launchGroup->has_executor()) {
-        convertResourceFormat(
-            launchGroup->mutable_executor()->mutable_resources(),
-            POST_RESERVATION_REFINEMENT);
-      }
-
-      foreach (
-          TaskInfo& task, *launchGroup->mutable_task_group()->mutable_tasks()) {
-        convertResourceFormat(
-            task.mutable_resources(),
-            POST_RESERVATION_REFINEMENT);
-
-        if (task.has_executor()) {
-          convertResourceFormat(
-              task.mutable_executor()->mutable_resources(),
-              POST_RESERVATION_REFINEMENT);
-        }
-      }
-
-      return None();
+      break;
     }
     case Offer::Operation::CREATE_VOLUME: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -587,7 +660,14 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
             " the Offer.Operation.create_volume field set.");
       }
 
-      return None();
+      Option<Error> error =
+        Resources::validate(operation->create_volume().source());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
     }
     case Offer::Operation::DESTROY_VOLUME: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -599,7 +679,14 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
             " the Offer.Operation.destroy_volume field set.");
       }
 
-      return None();
+      Option<Error> error =
+        Resources::validate(operation->destroy_volume().volume());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
     }
     case Offer::Operation::CREATE_BLOCK: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -611,7 +698,14 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
             " the Offer.Operation.create_block field set.");
       }
 
-      return None();
+      Option<Error> error =
+        Resources::validate(operation->create_block().source());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
     }
     case Offer::Operation::DESTROY_BLOCK: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -623,7 +717,14 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
             " the Offer.Operation.destroy_block field set.");
       }
 
-      return None();
+      Option<Error> error =
+        Resources::validate(operation->destroy_block().block());
+
+      if (error.isSome()) {
+        return error;
+      }
+
+      break;
     }
     case Offer::Operation::UNKNOWN: {
       // TODO(mpark): Once we perform a sanity check validation for
@@ -632,28 +733,143 @@ Option<Error> validateAndNormalizeResources(Offer::Operation* operation)
       return Error("Unknown offer operation");
     }
   }
-  UNREACHABLE();
+
+  upgradeResources(operation);
+
+  return None();
+}
+
+
+Try<Nothing> downgradeResource(Resource* resource)
+{
+  CHECK(!resource->has_role());
+  CHECK(!resource->has_reservation());
+
+  if (Resources::hasRefinedReservations(*resource)) {
+    return Error("Cannot downgrade resources containing refined reservations");
+  }
+
+  convertResourceFormat(resource, PRE_RESERVATION_REFINEMENT);
+  return Nothing();
 }
 
 
 Try<Nothing> downgradeResources(RepeatedPtrField<Resource>* resources)
 {
-  foreach (const Resource& resource, *resources) {
-    CHECK(!resource.has_role());
-    CHECK(!resource.has_reservation());
-  }
+  CHECK_NOTNULL(resources);
 
-  foreach (const Resource& resource, *resources) {
-    if (Resources::hasRefinedReservations(resource)) {
-      return Error(
-          "Invalid resources downgrade: resource " + stringify(resource) +
-          " with refined reservations cannot be downgraded");
+  foreach (Resource& resource, *resources) {
+    Try<Nothing> result = downgradeResource(&resource);
+    if (result.isError()) {
+      return result;
     }
   }
 
-  convertResourceFormat(resources, PRE_RESERVATION_REFINEMENT);
+  return Nothing();
+}
+
+namespace internal {
+
+// Given a protobuf descriptor `descriptor`, returns `true` if `descriptor`
+// is a `mesos::Resource`, or contains a `mesos::Resource` somewhere within.
+//
+// The provided `result` is recursively populated, where the keys are the
+// message descriptors within `descriptor`'s schema (including itself), and
+//  the corresponding value is `true` if the key contains a `mesos::Resource`.
+static void precomputeResourcesContainment(
+    const Descriptor* descriptor,
+    hashmap<const Descriptor*, bool>* result)
+{
+  CHECK_NOTNULL(descriptor);
+  CHECK_NOTNULL(result);
+
+  if (result->contains(descriptor)) {
+    return;
+  }
+
+  if (descriptor == mesos::Resource::descriptor()) {
+    result->insert({descriptor, true});
+  }
+
+  result->insert({descriptor, false});
+  for (int i = 0; i < descriptor->field_count(); ++i) {
+    // `message_type()` returns `nullptr` if the field is not a message type.
+    const Descriptor* messageDescriptor = descriptor->field(i)->message_type();
+    if (messageDescriptor == nullptr) {
+      continue;
+    }
+    precomputeResourcesContainment(messageDescriptor, result);
+    result->at(descriptor) |= result->at(messageDescriptor);
+  }
+}
+
+
+static Try<Nothing> downgradeResourcesImpl(
+    Message* message,
+    const hashmap<const Descriptor*, bool>& resourcesContainment)
+{
+  CHECK_NOTNULL(message);
+
+  const Descriptor* descriptor = message->GetDescriptor();
+
+  if (descriptor == mesos::Resource::descriptor()) {
+    return downgradeResource(static_cast<mesos::Resource*>(message));
+  }
+
+  const google::protobuf::Reflection* reflection = message->GetReflection();
+
+  for (int i = 0; i < descriptor->field_count(); ++i) {
+    const google::protobuf::FieldDescriptor* field = descriptor->field(i);
+    const Descriptor* messageDescriptor = field->message_type();
+
+    if (messageDescriptor == nullptr ||
+        !resourcesContainment.at(messageDescriptor)) {
+      continue;
+    }
+
+    if (!field->is_repeated()) {
+      if (reflection->HasField(*message, field)) {
+        Try<Nothing> result = downgradeResourcesImpl(
+            reflection->MutableMessage(message, field), resourcesContainment);
+
+        if (result.isError()) {
+          return result;
+        }
+      }
+    } else {
+      const int size = reflection->FieldSize(*message, field);
+
+      for (int j = 0; j < size; ++j) {
+        Try<Nothing> result = downgradeResourcesImpl(
+            reflection->MutableRepeatedMessage(message, field, j),
+            resourcesContainment);
+
+        if (result.isError()) {
+          return result;
+        }
+      }
+    }
+  }
 
   return Nothing();
+}
+
+}  // namespace internal {
+
+Try<Nothing> downgradeResources(Message* message)
+{
+  CHECK_NOTNULL(message);
+
+  const Descriptor* descriptor = message->GetDescriptor();
+
+  hashmap<const Descriptor*, bool> resourcesContainment;
+  internal::precomputeResourcesContainment(descriptor, &resourcesContainment);
+
+  if (!resourcesContainment.at(descriptor)) {
+    return Nothing();
+  }
+
+  return internal::downgradeResourcesImpl(message, resourcesContainment);
 }
 
 } // namespace mesos {

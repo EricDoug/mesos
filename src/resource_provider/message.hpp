@@ -24,6 +24,7 @@
 #include <mesos/resources.hpp>
 
 #include <stout/check.hpp>
+#include <stout/hashmap.hpp>
 #include <stout/jsonify.hpp>
 #include <stout/option.hpp>
 #include <stout/protobuf.hpp>
@@ -40,26 +41,33 @@ struct ResourceProviderMessage
   enum class Type
   {
     UPDATE_STATE,
-    UPDATE_OFFER_OPERATION_STATUS
+    UPDATE_OPERATION_STATUS,
+    DISCONNECT
   };
 
   struct UpdateState
   {
-    ResourceProviderID id;
-    UUID resourceVersionUuid;
-    Resources total;
-    std::vector<OfferOperation> operations;
+    ResourceProviderInfo info;
+    id::UUID resourceVersion;
+    Resources totalResources;
+    hashmap<id::UUID, Operation> operations;
   };
 
-  struct UpdateOfferOperationStatus
+  struct UpdateOperationStatus
   {
-    OfferOperationStatusUpdate update;
+    UpdateOperationStatusMessage update;
+  };
+
+  struct Disconnect
+  {
+    ResourceProviderID resourceProviderId;
   };
 
   Type type;
 
   Option<UpdateState> updateState;
-  Option<UpdateOfferOperationStatus> updateOfferOperationStatus;
+  Option<UpdateOperationStatus> updateOperationStatus;
+  Option<Disconnect> disconnect;
 };
 
 
@@ -76,29 +84,37 @@ inline std::ostream& operator<<(
 
       return stream
           << "UPDATE_STATE: "
-          << updateState->id << " "
-          << updateState->total;
+          << updateState->info.id() << " "
+          << updateState->totalResources;
     }
 
-    case ResourceProviderMessage::Type::UPDATE_OFFER_OPERATION_STATUS: {
-      const Option<ResourceProviderMessage::UpdateOfferOperationStatus>&
-        updateOfferOperationStatus =
-          resourceProviderMessage.updateOfferOperationStatus;
+    case ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS: {
+      const Option<ResourceProviderMessage::UpdateOperationStatus>&
+        updateOperationStatus =
+          resourceProviderMessage.updateOperationStatus;
 
-      CHECK_SOME(updateOfferOperationStatus);
-
-      Try<UUID> operationUUID =
-        UUID::fromBytes(updateOfferOperationStatus->update.operation_uuid());
-      CHECK_SOME(operationUUID);
+      CHECK_SOME(updateOperationStatus);
 
       return stream
-          << "UPDATE_OFFER_OPERATION_STATUS: (uuid: " << operationUUID.get()
+          << "UPDATE_OPERATION_STATUS: (uuid: "
+          << updateOperationStatus->update.operation_uuid()
           << ") for framework "
-          << updateOfferOperationStatus->update.framework_id()
+          << updateOperationStatus->update.framework_id()
           << " (latest state: "
-          << updateOfferOperationStatus->update.latest_status().state()
+          << updateOperationStatus->update.latest_status().state()
           << ", status update state: "
-          << updateOfferOperationStatus->update.status().state() << ")";
+          << updateOperationStatus->update.status().state() << ")";
+    }
+
+    case ResourceProviderMessage::Type::DISCONNECT: {
+      const Option<ResourceProviderMessage::Disconnect>& disconnect =
+        resourceProviderMessage.disconnect;
+
+      CHECK_SOME(disconnect);
+
+      return stream
+          << "DISCONNECT: resource provider "
+          << disconnect->resourceProviderId;
     }
   }
 

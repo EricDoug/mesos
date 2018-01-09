@@ -395,6 +395,14 @@ bool operator==(const MasterInfo& left, const MasterInfo& right)
 
 
 bool operator==(
+    const ResourceProviderInfo::Storage& left,
+    const ResourceProviderInfo::Storage& right)
+{
+  return left.plugin() == right.plugin();
+}
+
+
+bool operator==(
     const ResourceProviderInfo& left,
     const ResourceProviderInfo& right)
 {
@@ -552,15 +560,15 @@ ostream& operator<<(ostream& stream, const OfferID& offerId)
 }
 
 
-ostream& operator<<(ostream& stream, const OfferOperationID& offerOperationId)
+ostream& operator<<(ostream& stream, const OperationID& operationId)
 {
-  return stream << offerOperationId.value();
+  return stream << operationId.value();
 }
 
 
-ostream& operator<<(ostream& stream, const OfferOperationState& state)
+ostream& operator<<(ostream& stream, const OperationState& state)
 {
-  return stream << OfferOperationState_Name(state);
+  return stream << OperationState_Name(state);
 }
 
 

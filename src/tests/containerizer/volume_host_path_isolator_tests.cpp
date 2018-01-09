@@ -83,7 +83,7 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_VolumeFromHost)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ExecutorInfo executor = createExecutorInfo(
       "test_executor",
@@ -140,7 +140,7 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_FileVolumeFromHost)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ExecutorInfo executor = createExecutorInfo(
       "test_executor",
@@ -198,7 +198,7 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_VolumeFromHostSandboxMountPoint)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ExecutorInfo executor = createExecutorInfo(
       "test_executor",
@@ -255,7 +255,7 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_FileVolumeFromHostSandboxMountPoint)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ExecutorInfo executor = createExecutorInfo(
       "test_executor",
@@ -304,7 +304,7 @@ TEST_F(VolumeHostPathIsolatorTest, ROOT_MountPropagation)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   string mountDirectory = path::join(flags.work_dir, "mount_directory");
   string mountPoint = path::join(mountDirectory, "mount_point");
@@ -380,14 +380,6 @@ TEST_P(VolumeHostPathIsolatorMesosTest, ROOT_ChangeRootFilesystem)
   flags.docker_registry = registry;
   flags.docker_store_dir = path::join(sandbox.get(), "store");
   flags.image_providers = "docker";
-
-#ifndef USE_SSL_SOCKET
-  // Disable operator API authentication for the default executor.
-  // Executor authentication currently has SSL as a dependency, so we
-  // cannot require executors to authenticate with the agent operator
-  // API if Mesos was not built with SSL support.
-  flags.authenticate_http_readwrite = false;
-#endif // USE_SSL_SOCKET
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 

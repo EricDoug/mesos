@@ -93,18 +93,15 @@ public:
   {
     slave::Flags slaveFlags = MesosTest::CreateSlaveFlags();
     if (GetParam() == ENABLED) {
-      constexpr SlaveInfo::Capability::Type capabilities[] = {
-        SlaveInfo::Capability::MULTI_ROLE,
-        SlaveInfo::Capability::HIERARCHICAL_ROLE,
-        SlaveInfo::Capability::RESERVATION_REFINEMENT,
-        SlaveInfo::Capability::RESOURCE_PROVIDER};
+      // Set the resource provider capability.
+      vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+      SlaveInfo::Capability capability;
+      capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+      capabilities.push_back(capability);
 
       slaveFlags.agent_features = SlaveCapabilities();
-      foreach (SlaveInfo::Capability::Type type, capabilities) {
-        SlaveInfo::Capability* capability =
-          slaveFlags.agent_features->add_capabilities();
-        capability->set_type(type);
-      }
+      slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+          {capabilities.begin(), capabilities.end()});
     }
 
     return slaveFlags;
@@ -116,8 +113,8 @@ public:
   Future<Resources> getOperationMessage(To to)
   {
     if (GetParam() == ENABLED) {
-      return FUTURE_PROTOBUF(ApplyOfferOperationMessage(), _, to)
-        .then([](const ApplyOfferOperationMessage& message) {
+      return FUTURE_PROTOBUF(ApplyOperationMessage(), _, to)
+        .then([](const ApplyOperationMessage& message) {
           switch (message.operation_info().type()) {
             case Offer::Operation::UNKNOWN:
             case Offer::Operation::LAUNCH:
@@ -191,7 +188,7 @@ INSTANTIATE_TEST_CASE_P(
         ResourceProviderCapability::ENABLED));
 
 
-// This tests that a framework can send back a Reserve offer operation
+// This tests that a framework can send back a Reserve operation
 // as a response to an offer, which updates the resources in the
 // allocator and results in the reserved resources being reoffered to
 // the framework. The framework then sends back an Unreserved offer
@@ -397,11 +394,11 @@ TEST_P(ReservationTest, ReserveTwiceWithDoubleValue)
 
 
 // This tests that a framework can send back a Reserve followed by a
-// LaunchTasks offer operation as a response to an offer, which
+// LaunchTasks operation as a response to an offer, which
 // updates the resources in the allocator then proceeds to launch the
 // task with the reserved resources. The reserved resources are
 // reoffered to the framework on task completion. The framework then
-// sends back an Unreserved offer operation to unreserve the reserved
+// sends back an Unreserved operation to unreserve the reserved
 // resources. We test that the framework receives the unreserved
 // resources.
 TEST_P(ReservationTest, ReserveAndLaunchThenUnreserve)
@@ -522,7 +519,7 @@ TEST_P(ReservationTest, ReserveAndLaunchThenUnreserve)
 
 
 // This test launches 2 frameworks in the same role. framework1
-// reserves resources by sending back a Reserve offer operation. We
+// reserves resources by sending back a Reserve operation. We
 // first test that framework1 receives the reserved resources, then on
 // the next resource offer, framework1 declines the offer. This
 // should lead to framework2 receiving the resources that framework1
@@ -644,9 +641,9 @@ TEST_P(ReservationTest, ReserveShareWithinRole)
 }
 
 
-// This tests that a Reserve offer operation where the specified
-// resources does not exist in the given offer (too large, in this
-// case) is dropped.
+// This tests that a Reserve operation where the specified resources
+// does not exist in the given offer (too large, in this case) is
+// dropped.
 TEST_P(ReservationTest, DropReserveTooLarge)
 {
   TestAllocator<> allocator;
@@ -712,7 +709,7 @@ TEST_P(ReservationTest, DropReserveTooLarge)
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers));
 
-  // Expect that the reserve offer operation will be dropped.
+  // Expect that the reserve operation will be dropped.
   EXPECT_CALL(allocator, updateAllocation(_, _, _, _))
     .Times(0);
 
@@ -846,6 +843,10 @@ TEST_P(ReservationTest, ResourcesCheckpointing)
 // dynamic reservations are later correctly offered to the framework.
 TEST_P(ReservationTest, MasterFailover)
 {
+  // Pause the cock and control it manually in order to
+  // control the timing of the offer cycle.
+  Clock::pause();
+
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_roles(0, "role");
 
@@ -866,6 +867,8 @@ TEST_P(ReservationTest, MasterFailover)
   Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
   ASSERT_SOME(slave);
 
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
   AWAIT_READY(slaveReady1);
 
   MockScheduler sched;
@@ -887,6 +890,10 @@ TEST_P(ReservationTest, MasterFailover)
 
   driver.start();
 
+  // Advance the clock to generate an offer.
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
   // In the first offer, expect an offer with unreserved resources.
   AWAIT_READY(offers);
 
@@ -907,9 +914,7 @@ TEST_P(ReservationTest, MasterFailover)
   AWAIT_READY(message);
 
   // This is to make sure operation message is processed.
-  Clock::pause();
   Clock::settle();
-  Clock::resume();
 
   EXPECT_CALL(sched, disconnected(&driver));
 
@@ -919,32 +924,22 @@ TEST_P(ReservationTest, MasterFailover)
   Try<Owned<cluster::Master>> master2 = StartMaster(masterFlags);
   ASSERT_SOME(master2);
 
-  Future<SlaveReregisteredMessage> slaveReregistered =
-    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
-
-  Future<Nothing> slaveReady2 = getSlaveReady();
-
   EXPECT_CALL(sched, registered(&driver, _, _));
 
   // The expectation for the next offer.
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());  // Ignore subsequent offers.
 
   // Simulate a new master detected event on the slave so that the
   // slave will do a re-registration.
   detector.appoint(master2.get()->pid);
 
   // Ensure agent registration is processed.
-  Clock::pause();
   Clock::advance(slaveFlags.authentication_backoff_factor);
   Clock::advance(slaveFlags.registration_backoff_factor);
   Clock::settle();
   Clock::resume();
-
-  // Wait for slave to confirm re-registration.
-  AWAIT_READY(slaveReregistered);
-
-  AWAIT_READY(slaveReady2);
 
   // In the next offer, expect an offer with the reserved resources.
   AWAIT_READY(offers);
@@ -1712,7 +1707,7 @@ TEST_P(ReservationTest, BadACLDropUnreserve)
 
 
 // Tests a couple more complex combinations of `RESERVE`, `UNRESERVE`, and
-// `LAUNCH` offer operations to verify that they work with authorization.
+// `LAUNCH` operations to verify that they work with authorization.
 TEST_P(ReservationTest, ACLMultipleOperations)
 {
   // Pause the clock and control it manually in order to
@@ -2217,7 +2212,7 @@ TEST_P(ReservationTest, DropReserveWithDifferentRole)
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
-  // Expect that the reserve offer operation will be dropped.
+  // Expect that the reserve operation will be dropped.
   EXPECT_CALL(allocator, updateAllocation(_, _, _, _))
     .Times(0);
 
@@ -2372,7 +2367,7 @@ TEST_P(ReservationTest, PreventUnreservingAlienResources)
   EXPECT_CALL(sched2, resourceOffers(&driver2, _))
     .WillOnce(FutureArg<1>(&offers));
 
-  // Expect that the unreserve offer operation will be dropped and hence
+  // Expect that the unreserve operation will be dropped and hence
   // allocator not called at all.
   EXPECT_CALL(allocator, updateAllocation(_, _, _, _))
     .Times(0);

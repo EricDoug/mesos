@@ -96,143 +96,11 @@ target_link_libraries(mesos-protobufs PUBLIC protobuf)
 target_include_directories(
   mesos-protobufs PUBLIC ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS})
 
-if (WIN32)
-  # Disable all compiler warnings on Protocol Buffers source.
-  target_compile_options(mesos-protobufs PRIVATE "/w")
-endif ()
-
 
 # BUILD JAVA ARTIFACTS.
 #######################
 if (HAS_JAVA)
-  # Build the Mesos JAR.
-  #
-  # NOTE: We do not utilize CMake's `UseJava` module for a few reasons:
-  #   (1) `add_jar()` calls `javac`, but we use Maven.
-  #   (2) `add_jar()` does not support something like `IMPORTED`.
-  #   (3) `create_javah()` checks the existence of each JAR in the given class
-  #       path at configuration time, even though it depends on `mesos-jar` to
-  #       run Maven at build time. Coupled with (1) and (2) this makes it
-  #       impossible to use.
-  set(MESOS_JAR ${CMAKE_CURRENT_BINARY_DIR}/java/target/mesos-${MESOS_PACKAGE_VERSION}.jar)
-  set(PROTOBUF_JAR ${CMAKE_CURRENT_BINARY_DIR}/java/target/dependency/protobuf-java-3.5.0.jar)
-
-  # This file is generated into the build tree.
-  set(MESOS_JAVA_LIBRARY java/generated/org/apache/mesos/MesosNativeLibrary.java)
-  configure_file(${MESOS_JAVA_LIBRARY}.in ${MESOS_JAVA_LIBRARY})
-
-  set(MESOS_JAR_SRC
-    java/src/org/apache/mesos/ExecutorDriver.java
-    java/src/org/apache/mesos/Executor.java
-    java/src/org/apache/mesos/Log.java
-    java/src/org/apache/mesos/MesosExecutorDriver.java
-    java/src/org/apache/mesos/MesosSchedulerDriver.java
-    java/src/org/apache/mesos/SchedulerDriver.java
-    java/src/org/apache/mesos/Scheduler.java
-    java/src/org/apache/mesos/state/AbstractState.java
-    java/src/org/apache/mesos/state/InMemoryState.java
-    java/src/org/apache/mesos/state/LevelDBState.java
-    java/src/org/apache/mesos/state/LogState.java
-    java/src/org/apache/mesos/state/State.java
-    java/src/org/apache/mesos/state/Variable.java
-    java/src/org/apache/mesos/state/ZooKeeperState.java
-    java/src/org/apache/mesos/v1/scheduler/V1Mesos.java
-    java/src/org/apache/mesos/v1/scheduler/Mesos.java
-    java/src/org/apache/mesos/v1/scheduler/Scheduler.java
-    java/src/org/apache/mesos/v1/scheduler/V0Mesos.java
-    ${CMAKE_CURRENT_BINARY_DIR}/${MESOS_JAVA_LIBRARY})
-
-  configure_file(java/mesos.pom.in java/mesos.pom)
-
-  add_custom_command(
-    COMMENT "Building ${MESOS_JAR} using Maven..."
-    OUTPUT ${MESOS_JAR}
-    COMMAND mvn -B -f mesos.pom clean package
-    DEPENDS ${MESOS_JAR_SRC} ${JAVA_PROTOBUF_SRC}
-    WORKING_DIRECTORY java)
-
-  add_custom_target(mesos-jar DEPENDS ${MESOS_JAR})
-
-  # TODO(andschwa): Build the Example JAR.
-  set(EXAMPLE_JAR_SRC
-    examples/java/TestExceptionFramework.java
-    examples/java/TestExecutor.java
-    examples/java/TestFramework.java
-    examples/java/TestLog.java
-    examples/java/TestMultipleExecutorsFramework.java
-    examples/java/V1TestFramework.java)
-
-  set(JAVA_SRC
-    java/jni/convert.cpp
-    java/jni/construct.cpp
-    java/jni/org_apache_mesos_Log.cpp
-    java/jni/org_apache_mesos_MesosExecutorDriver.cpp
-    java/jni/org_apache_mesos_MesosNativeLibrary.cpp
-    java/jni/org_apache_mesos_MesosSchedulerDriver.cpp
-    java/jni/org_apache_mesos_state_AbstractState.cpp
-    java/jni/org_apache_mesos_state_LevelDBState.cpp
-    java/jni/org_apache_mesos_state_LogState.cpp
-    java/jni/org_apache_mesos_state_Variable.cpp
-    java/jni/org_apache_mesos_state_ZooKeeperState.cpp
-    java/jni/org_apache_mesos_v1_scheduler_V1Mesos.cpp
-    java/jni/org_apache_mesos_v1_scheduler_V0Mesos.cpp
-    jvm/jvm.cpp
-    jvm/org/apache/log4j.cpp
-    jvm/org/apache/zookeeper.cpp)
-
-  # These are generated and so must be included.
-  set(JAVA_H
-    java/jni/org_apache_mesos_Log.h
-    java/jni/org_apache_mesos_MesosExecutorDriver.h
-    java/jni/org_apache_mesos_MesosSchedulerDriver.h
-    java/jni/org_apache_mesos_state_AbstractState.h
-    java/jni/org_apache_mesos_state_LevelDBState.h
-    java/jni/org_apache_mesos_state_LogState.h
-    java/jni/org_apache_mesos_state_Variable.h
-    java/jni/org_apache_mesos_state_ZooKeeperState.h
-    java/jni/org_apache_mesos_v1_scheduler_V1Mesos.h
-    java/jni/org_apache_mesos_v1_scheduler_V0Mesos.h)
-
-  set(JAVA_CLASSES
-    org.apache.mesos.Log
-    org.apache.mesos.MesosExecutorDriver
-    org.apache.mesos.MesosSchedulerDriver
-    org.apache.mesos.state.AbstractState
-    org.apache.mesos.state.LevelDBState
-    org.apache.mesos.state.LogState
-    org.apache.mesos.state.Variable
-    org.apache.mesos.state.ZooKeeperState
-    org.apache.mesos.v1.scheduler.V1Mesos
-    org.apache.mesos.v1.scheduler.V0Mesos)
-
-  # This generates the header files.
-  if (WIN32)
-    set(COLON ";")
-  else ()
-    set(COLON ":")
-  endif ()
-
-  add_custom_command(
-    OUTPUT ${JAVA_H}
-    COMMAND ${Java_JAVAH_EXECUTABLE} -d java/jni -classpath "${MESOS_JAR}${COLON}${PROTOBUF_JAR}" ${JAVA_CLASSES}
-    DEPENDS mesos-jar make_bin_jni_dir)
-
-  # We include the headers here to establish the dependency
-  # on the above custom command.
-  add_library(mesos-java ${JAVA_SRC} ${JAVA_H})
-
-  target_link_libraries(
-    mesos-java
-    mesos-protobufs
-    process
-    zookeeper
-    ${JNI_LIBRARIES})
-
-  target_include_directories(
-    mesos-java PUBLIC
-    ${JNI_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_BINARY_DIR}/java/jni
-    ${MESOS_PUBLIC_INCLUDE_DIR})
+  add_subdirectory(java)
 endif ()
 
 
@@ -246,6 +114,7 @@ configure_file(
 # SOURCE FILES FOR THE MESOS LIBRARY.
 #####################################
 set(AGENT_SRC
+  slave/compatibility.cpp
   slave/constants.cpp
   slave/container_daemon.cpp
   slave/container_logger.cpp
@@ -272,13 +141,11 @@ set(AGENT_SRC
   slave/containerizer/mesos/launcher.cpp
   slave/containerizer/mesos/mount.cpp
   slave/containerizer/mesos/paths.cpp
-  slave/containerizer/mesos/utils.cpp
   slave/containerizer/mesos/io/switchboard.cpp
   slave/containerizer/mesos/provisioner/backend.cpp
   slave/containerizer/mesos/provisioner/paths.cpp
   slave/containerizer/mesos/provisioner/provisioner.cpp
   slave/containerizer/mesos/provisioner/store.cpp
-  slave/containerizer/mesos/provisioner/utils.cpp
   slave/containerizer/mesos/provisioner/appc/cache.cpp
   slave/containerizer/mesos/provisioner/appc/fetcher.cpp
   slave/containerizer/mesos/provisioner/appc/paths.cpp
@@ -298,6 +165,7 @@ if (WIN32)
     slave/containerizer/mesos/isolators/windows/mem.cpp)
 else ()
   list(APPEND AGENT_SRC
+    slave/containerizer/mesos/utils.cpp
     slave/containerizer/mesos/isolators/environment_secret.cpp
     slave/containerizer/mesos/isolators/docker/volume/driver.cpp
     slave/containerizer/mesos/isolators/docker/volume/paths.cpp
@@ -306,7 +174,8 @@ else ()
     slave/containerizer/mesos/isolators/network/cni/spec.cpp
     slave/containerizer/mesos/isolators/posix/disk.cpp
     slave/containerizer/mesos/isolators/posix/rlimits.cpp
-    slave/containerizer/mesos/isolators/volume/sandbox_path.cpp)
+    slave/containerizer/mesos/isolators/volume/sandbox_path.cpp
+    slave/containerizer/mesos/provisioner/utils.cpp)
 endif ()
 
 set(APPC_SRC
@@ -490,6 +359,9 @@ set(SECRET_SRC
 set(STATE_SRC
   state/in_memory.cpp)
 
+set(STATUS_UPDATE_MANAGER_SRC
+  status_update_manager/operation.cpp)
+
 if (NOT WIN32)
   list(APPEND STATE_SRC
     state/leveldb.cpp
@@ -545,6 +417,7 @@ set(MESOS_SRC
   ${DOCKER_SRC}
   ${EXECUTOR_SRC}
   ${FILES_SRC}
+  ${HDFS_SRC}
   ${HEALTH_CHECK_SRC}
   ${INTERNAL_SRC}
   ${LOCAL_SRC}
@@ -557,6 +430,7 @@ set(MESOS_SRC
   ${SCHEDULER_SRC}
   ${SECRET_SRC}
   ${STATE_SRC}
+  ${STATUS_UPDATE_MANAGER_SRC}
   ${URI_SRC}
   ${USAGE_SRC}
   ${V1_SRC}
@@ -566,7 +440,6 @@ set(MESOS_SRC
 
 if (NOT WIN32)
   list(APPEND MESOS_SRC
-    ${HDFS_SRC}
     ${LOG_SRC}
     ${POSIX_SRC})
 endif ()
@@ -596,8 +469,8 @@ if (WIN32)
 endif ()
 
 
-# THE MESOS LIBRARY (generates, e.g., libmesos.so on Linux).
-############################################################
+# THE MESOS LIBRARY
+###################
 add_library(mesos ${MESOS_SRC})
 
 set_target_properties(
@@ -605,16 +478,7 @@ set_target_properties(
   VERSION ${MESOS_PACKAGE_VERSION}
   SOVERSION ${MESOS_PACKAGE_SOVERSION})
 
-# NOTE: The quotes in these definitions are necessary. Without them, the
-# preprocessor will interpret the symbols as (e.g.) int literals and unquoted
-# identifiers, rather than the string values our code expects.
-target_compile_definitions(
-  mesos PUBLIC
-  USE_CMAKE_BUILD_CONFIG
-  BUILD_JAVA_JVM_LIBRARY="${JAVA_JVM_LIBRARY}"
-
-  # TODO(andschwa): (MESOS-5455) `BUILD_FLAGS` is currently a placeholder value.
-  BUILD_FLAGS="")
+target_compile_definitions(mesos PUBLIC USE_CMAKE_BUILD_CONFIG)
 
 target_include_directories(
   mesos PUBLIC

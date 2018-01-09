@@ -440,6 +440,7 @@ using mesos::v1::MachineID;
 using mesos::v1::Metric;
 using mesos::v1::Offer;
 using mesos::v1::Resource;
+using mesos::v1::ResourceProviderInfo;
 using mesos::v1::Resources;
 using mesos::v1::TaskID;
 using mesos::v1::TaskInfo;
@@ -802,7 +803,7 @@ inline TTaskInfo createTask(
     const TCommandInfo& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = UUID::random().toString())
+    const std::string& id = id::UUID::random().toString())
 {
   TTaskInfo task;
   task.set_name(name);
@@ -836,7 +837,7 @@ inline TTaskInfo createTask(
     const std::string& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = UUID::random().toString())
+    const std::string& id = id::UUID::random().toString())
 {
   return createTask<
       TTaskInfo,
@@ -868,7 +869,7 @@ inline TTaskInfo createTask(
     const std::string& command,
     const Option<TExecutorID>& executorId = None(),
     const std::string& name = "test-task",
-    const std::string& id = UUID::random().toString())
+    const std::string& id = id::UUID::random().toString())
 {
   return createTask<
       TTaskInfo,
@@ -1137,8 +1138,10 @@ inline TResource createPersistentVolume(
     const Option<std::string>& creatorPrincipal = None(),
     bool isShared = false)
 {
-  TResource volume =
-    TResources::parse("disk", stringify(size.megabytes()), role).get();
+  TResource volume = TResources::parse(
+      "disk",
+      stringify((double) size.bytes() / Bytes::MEGABYTES),
+      role).get();
 
   volume.mutable_disk()->CopyFrom(
       createDiskInfo<TResource, TVolume>(
@@ -1269,7 +1272,7 @@ inline TDomainInfo createDomainInfo(
 }
 
 
-// Helpers for creating offer operations.
+// Helpers for creating operations.
 template <typename TResources, typename TOffer>
 inline typename TOffer::Operation RESERVE(const TResources& resources)
 {
@@ -1345,7 +1348,7 @@ inline typename TOffer::Operation CREATE_VOLUME(
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::CREATE_VOLUME);
   operation.mutable_create_volume()->mutable_source()->CopyFrom(source);
-  operation.set_target_type(type);
+  operation.mutable_create_volume()->set_target_type(type);
   return operation;
 }
 
@@ -2446,8 +2449,8 @@ public:
       void(Mesos*, const typename Event::RescindInverseOffer&));
   MOCK_METHOD2_T(update, void(Mesos*, const typename Event::Update&));
   MOCK_METHOD2_T(
-      offerOperationUpdate,
-      void(Mesos*, const typename Event::OfferOperationUpdate&));
+      updateOperationStatus,
+      void(Mesos*, const typename Event::UpdateOperationStatus&));
   MOCK_METHOD2_T(message, void(Mesos*, const typename Event::Message&));
   MOCK_METHOD2_T(failure, void(Mesos*, const typename Event::Failure&));
   MOCK_METHOD2_T(error, void(Mesos*, const typename Event::Error&));
@@ -2476,9 +2479,9 @@ public:
           break;
         case Event::UPDATE:
           update(mesos, event.update());
-        break;
-      case Event::OFFER_OPERATION_UPDATE:
-        offerOperationUpdate(mesos, event.offer_operation_update());
+          break;
+        case Event::UPDATE_OPERATION_STATUS:
+          updateOperationStatus(mesos, event.update_operation_status());
           break;
         case Event::MESSAGE:
           message(mesos, event.message());
@@ -2736,7 +2739,7 @@ ACTION_P3(SendUpdateFromTask, frameworkId, executorId, state)
   status.mutable_executor_id()->CopyFrom(executorId);
   status.set_state(state);
   status.set_source(mesos::v1::TaskStatus::SOURCE_EXECUTOR);
-  status.set_uuid(UUID::random().toBytes());
+  status.set_uuid(id::UUID::random().toBytes());
 
   mesos::v1::executor::Call call;
   call.mutable_framework_id()->CopyFrom(frameworkId);
@@ -2757,7 +2760,7 @@ ACTION_P3(SendUpdateFromTaskID, frameworkId, executorId, state)
   status.mutable_executor_id()->CopyFrom(executorId);
   status.set_state(state);
   status.set_source(mesos::v1::TaskStatus::SOURCE_EXECUTOR);
-  status.set_uuid(UUID::random().toBytes());
+  status.set_uuid(id::UUID::random().toBytes());
 
   mesos::v1::executor::Call call;
   call.mutable_framework_id()->CopyFrom(frameworkId);
@@ -2789,7 +2792,7 @@ template <
     typename Resource,
     typename Resources,
     typename ResourceProviderID,
-    typename OfferOperationState,
+    typename OperationState,
     typename Operation,
     typename Source>
 class MockResourceProvider
@@ -2812,7 +2815,7 @@ public:
               Resource,
               Resources,
               ResourceProviderID,
-              OfferOperationState,
+              OperationState,
               Operation,
               Source>::connectedDefault));
     EXPECT_CALL(*this, connected()).WillRepeatedly(DoDefault());
@@ -2828,12 +2831,12 @@ public:
               Resource,
               Resources,
               ResourceProviderID,
-              OfferOperationState,
+              OperationState,
               Operation,
               Source>::subscribedDefault));
     EXPECT_CALL(*this, subscribed(_)).WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, operation(_))
+    ON_CALL(*this, applyOperation(_))
       .WillByDefault(Invoke(
           this,
           &MockResourceProvider<
@@ -2844,17 +2847,41 @@ public:
               Resource,
               Resources,
               ResourceProviderID,
-              OfferOperationState,
+              OperationState,
               Operation,
               Source>::operationDefault));
-    EXPECT_CALL(*this, operation(_)).WillRepeatedly(DoDefault());
+    EXPECT_CALL(*this, applyOperation(_)).WillRepeatedly(DoDefault());
+
+    ON_CALL(*this, publishResources(_))
+      .WillByDefault(Invoke(
+          this,
+          &MockResourceProvider<
+              Event,
+              Call,
+              Driver,
+              ResourceProviderInfo,
+              Resource,
+              Resources,
+              ResourceProviderID,
+              OperationState,
+              Operation,
+              Source>::publishDefault));
+    EXPECT_CALL(*this, publishResources(_)).WillRepeatedly(DoDefault());
   }
 
   MOCK_METHOD0_T(connected, void());
   MOCK_METHOD0_T(disconnected, void());
   MOCK_METHOD1_T(subscribed, void(const typename Event::Subscribed&));
-  MOCK_METHOD1_T(operation, void(const typename Event::Operation&));
-  MOCK_METHOD1_T(publish, void(const typename Event::Publish&));
+  MOCK_METHOD1_T(applyOperation, void(const typename Event::ApplyOperation&));
+  MOCK_METHOD1_T(
+      publishResources,
+      void(const typename Event::PublishResources&));
+  MOCK_METHOD1_T(
+      acknowledgeOperationStatus,
+      void(const typename Event::AcknowledgeOperationStatus&));
+  MOCK_METHOD1_T(
+      reconcileOperations,
+      void(const typename Event::ReconcileOperations&));
 
   void events(std::queue<Event> events)
   {
@@ -2866,11 +2893,17 @@ public:
         case Event::SUBSCRIBED:
           subscribed(event.subscribed());
           break;
-        case Event::OPERATION:
-          operation(event.operation());
+        case Event::APPLY_OPERATION:
+          applyOperation(event.apply_operation());
           break;
-        case Event::PUBLISH:
-          publish(event.publish());
+        case Event::PUBLISH_RESOURCES:
+          publishResources(event.publish_resources());
+          break;
+        case Event::ACKNOWLEDGE_OPERATION_STATUS:
+          acknowledgeOperationStatus(event.acknowledge_operation_status());
+          break;
+        case Event::RECONCILE_OPERATIONS:
+          reconcileOperations(event.reconcile_operations());
           break;
         case Event::UNKNOWN:
           LOG(FATAL) << "Received unexpected UNKNOWN event";
@@ -2902,7 +2935,7 @@ public:
                 Resource,
                 Resources,
                 ResourceProviderID,
-                OfferOperationState,
+                OperationState,
                 Operation,
                 Source>::connected,
             this),
@@ -2915,7 +2948,7 @@ public:
                 Resource,
                 Resources,
                 ResourceProviderID,
-                OfferOperationState,
+                OperationState,
                 Operation,
                 Source>::disconnected,
             this),
@@ -2928,12 +2961,14 @@ public:
                 Resource,
                 Resources,
                 ResourceProviderID,
-                OfferOperationState,
+                OperationState,
                 Operation,
                 Source>::events,
             this,
             lambda::_1),
         credential));
+
+    driver->start();
   }
 
   void connectedDefault()
@@ -2963,27 +2998,28 @@ public:
 
       typename Call::UpdateState* update = call.mutable_update_state();
       update->mutable_resources()->CopyFrom(injected);
-      update->set_resource_version_uuid(UUID::random().toBytes());
+      update->mutable_resource_version_uuid()->set_value(
+          id::UUID::random().toBytes());
 
       driver->send(call);
     }
   }
 
-  void operationDefault(const typename Event::Operation& operation)
+  void operationDefault(const typename Event::ApplyOperation& operation)
   {
     CHECK(info.has_id());
 
     Call call;
-    call.set_type(Call::UPDATE_OFFER_OPERATION_STATUS);
+    call.set_type(Call::UPDATE_OPERATION_STATUS);
     call.mutable_resource_provider_id()->CopyFrom(info.id());
 
-    typename Call::UpdateOfferOperationStatus* update =
-      call.mutable_update_offer_operation_status();
+    typename Call::UpdateOperationStatus* update =
+      call.mutable_update_operation_status();
     update->mutable_framework_id()->CopyFrom(operation.framework_id());
-    update->set_operation_uuid(operation.operation_uuid());
+    update->mutable_operation_uuid()->CopyFrom(operation.operation_uuid());
 
     update->mutable_status()->set_state(
-        OfferOperationState::OFFER_OPERATION_FINISHED);
+        OperationState::OPERATION_FINISHED);
 
     switch (operation.info().type()) {
       case Operation::LAUNCH:
@@ -3015,7 +3051,7 @@ public:
           ->Mutable(0)
           ->mutable_disk()
           ->mutable_source()
-          ->set_type(Source::BLOCK);
+          ->set_type(Source::RAW);
         break;
       case Operation::CREATE_BLOCK:
         update->mutable_status()->add_converted_resources()->CopyFrom(
@@ -3042,6 +3078,22 @@ public:
     }
 
     update->mutable_latest_status()->CopyFrom(update->status());
+
+    driver->send(call);
+  }
+
+  void publishDefault(const typename Event::PublishResources& publish)
+  {
+    CHECK(info.has_id());
+
+    Call call;
+    call.set_type(Call::UPDATE_PUBLISH_RESOURCES_STATUS);
+    call.mutable_resource_provider_id()->CopyFrom(info.id());
+
+    typename Call::UpdatePublishResourcesStatus* update =
+      call.mutable_update_publish_resources_status();
+    update->mutable_uuid()->CopyFrom(publish.uuid());
+    update->set_status(Call::UpdatePublishResourcesStatus::OK);
 
     driver->send(call);
   }
@@ -3074,7 +3126,7 @@ using MockResourceProvider = tests::resource_provider::MockResourceProvider<
     mesos::v1::Resource,
     mesos::v1::Resources,
     mesos::v1::ResourceProviderID,
-    mesos::v1::OfferOperationState,
+    mesos::v1::OperationState,
     mesos::v1::Offer::Operation,
     mesos::v1::Resource::DiskInfo::Source>;
 
@@ -3401,6 +3453,44 @@ void ExpectNoFutureUnionHttpProtobufs(
 
   process::ExpectNoFutureUnionHttpRequests(
       message, unionType, path, deserializer);
+}
+
+
+// This matcher is used to match a vector of resource offers that
+// contains an offer having any resource that passes the filter.
+MATCHER_P(OffersHaveAnyResource, filter, "")
+{
+  foreach (const Offer& offer, arg) {
+    foreach (const Resource& resource, offer.resources()) {
+      if (filter(resource)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+
+// This matcher is used to match a vector of resource offers that
+// contains an offer having the specified resource.
+MATCHER_P(OffersHaveResource, resource, "")
+{
+  foreach (const Offer& offer, arg) {
+    Resources resources = offer.resources();
+
+    // If `resource` is not allocated, we are matching offers against
+    // resources constructed from scratch, so we strip off allocations.
+    if (!resource.has_allocation_info()) {
+      resources.unallocate();
+    }
+
+    if (resources.contains(resource)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 

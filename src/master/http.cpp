@@ -878,17 +878,17 @@ Future<Response> Master::Http::subscribe(
           ok.type = Response::PIPE;
           ok.reader = pipe.reader();
 
-          HttpConnection http{pipe.writer(), contentType, UUID::random()};
+          HttpConnection http{pipe.writer(), contentType, id::UUID::random()};
           master->subscribe(http, principal);
 
           mesos::master::Event event;
           event.set_type(mesos::master::Event::SUBSCRIBED);
-          event.mutable_subscribed()->mutable_get_state()->CopyFrom(
+          *event.mutable_subscribed()->mutable_get_state() =
               _getState(
                   frameworksApprover,
                   tasksApprover,
                   executorsApprover,
-                  rolesAcceptor));
+                  rolesAcceptor);
 
           event.mutable_subscribed()->set_heartbeat_interval_seconds(
               DEFAULT_HEARTBEAT_INTERVAL.secs());
@@ -1058,7 +1058,7 @@ Future<Response> Master::Http::scheduler(
     ok.reader = pipe.reader();
 
     // Generate a stream ID and return it in the response.
-    UUID streamId = UUID::random();
+    id::UUID streamId = id::UUID::random();
     ok.headers["Mesos-Stream-Id"] = streamId.toString();
 
     HttpConnection http {pipe.writer(), acceptType, streamId};
@@ -1151,17 +1151,17 @@ Future<Response> Master::Http::scheduler(
       master->acknowledge(framework, call.acknowledge());
       return Accepted();
 
-    // TODO(greggomann): Implement offer operation update acknowledgement.
-    case scheduler::Call::ACKNOWLEDGE_OFFER_OPERATION_UPDATE:
-      return Forbidden("Offer operation updates are not yet implemented");
+    // TODO(greggomann): Implement operation status acknowledgement.
+    case scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS:
+      return Forbidden("Operation status updates are not yet implemented");
 
     case scheduler::Call::RECONCILE:
       master->reconcile(framework, call.reconcile());
       return Accepted();
 
-    // TODO(greggomann): Implement offer operation update reconciliation.
-    case scheduler::Call::RECONCILE_OFFER_OPERATIONS:
-      return Forbidden("Offer operation reconciliation is not yet implemented");
+    // TODO(greggomann): Implement operation reconciliation.
+    case scheduler::Call::RECONCILE_OPERATIONS:
+      return Forbidden("Operation reconciliation is not yet implemented");
 
     case scheduler::Call::MESSAGE:
       master->message(framework, call.message());
@@ -1306,12 +1306,12 @@ Future<Response> Master::Http::_createVolumes(
     return BadRequest("No agent found with specified ID");
   }
 
-  // Create an offer operation.
+  // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::CREATE);
   operation.mutable_create()->mutable_volumes()->CopyFrom(volumes);
 
-  Option<Error> error = validateAndNormalizeResources(&operation);
+  Option<Error> error = validateAndUpgradeResources(&operation);
   if (error.isSome()) {
     return BadRequest(error->message);
   }
@@ -1480,12 +1480,12 @@ Future<Response> Master::Http::_destroyVolumes(
     return BadRequest("No agent found with specified ID");
   }
 
-  // Create an offer operation.
+  // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::DESTROY);
   operation.mutable_destroy()->mutable_volumes()->CopyFrom(volumes);
 
-  Option<Error> error = validateAndNormalizeResources(&operation);
+  Option<Error> error = validateAndUpgradeResources(&operation);
   if (error.isSome()) {
     return BadRequest(error->message);
   }
@@ -1745,8 +1745,7 @@ Future<Response> Master::Http::getFrameworks(
           -> Future<Response> {
       mesos::master::Response response;
       response.set_type(mesos::master::Response::GET_FRAMEWORKS);
-      response.mutable_get_frameworks()->CopyFrom(
-          _getFrameworks(frameworksApprover));
+      *response.mutable_get_frameworks() = _getFrameworks(frameworksApprover);
 
       return OK(serialize(contentType, evolve(response)),
                 stringify(contentType));
@@ -1765,7 +1764,7 @@ mesos::master::Response::GetFrameworks Master::Http::_getFrameworks(
       continue;
     }
 
-    getFrameworks.add_frameworks()->CopyFrom(model(*framework));
+    *getFrameworks.add_frameworks() = model(*framework);
   }
 
   foreachvalue (const Owned<Framework>& framework,
@@ -1775,7 +1774,7 @@ mesos::master::Response::GetFrameworks Master::Http::_getFrameworks(
       continue;
     }
 
-    getFrameworks.add_completed_frameworks()->CopyFrom(model(*framework));
+    *getFrameworks.add_completed_frameworks() = model(*framework);
   }
 
   return getFrameworks;
@@ -1818,8 +1817,8 @@ Future<Response> Master::Http::getExecutors(
       mesos::master::Response response;
       response.set_type(mesos::master::Response::GET_EXECUTORS);
 
-      response.mutable_get_executors()->CopyFrom(
-          _getExecutors(frameworksApprover, executorsApprover));
+      *response.mutable_get_executors() =
+          _getExecutors(frameworksApprover, executorsApprover);
 
       return OK(serialize(contentType, evolve(response)),
                 stringify(contentType));
@@ -1933,12 +1932,13 @@ Future<Response> Master::Http::getState(
 
           mesos::master::Response response;
           response.set_type(mesos::master::Response::GET_STATE);
-          response.mutable_get_state()->CopyFrom(
+
+          *response.mutable_get_state() =
               _getState(
                   frameworksApprover,
                   tasksApprover,
                   executorsApprover,
-                  rolesAcceptor));
+                  rolesAcceptor);
 
           return OK(
               serialize(contentType, evolve(response)), stringify(contentType));
@@ -1959,16 +1959,17 @@ mesos::master::Response::GetState Master::Http::_getState(
 
   mesos::master::Response::GetState getState;
 
-  getState.mutable_get_tasks()->CopyFrom(
-      _getTasks(frameworksApprover, tasksApprover));
+  *getState.mutable_get_tasks() =
+      _getTasks(frameworksApprover, tasksApprover);
 
-  getState.mutable_get_executors()->CopyFrom(
-      _getExecutors(frameworksApprover, executorsApprover));
+  *getState.mutable_get_executors() =
+      _getExecutors(frameworksApprover, executorsApprover);
 
-  getState.mutable_get_frameworks()->CopyFrom(
-      _getFrameworks(frameworksApprover));
+  *getState.mutable_get_frameworks() =
+      _getFrameworks(frameworksApprover);
 
-  getState.mutable_get_agents()->CopyFrom(_getAgents(rolesAcceptor));
+  *getState.mutable_get_agents() =
+      _getAgents(rolesAcceptor);
 
   return getState;
 }
@@ -2467,12 +2468,12 @@ Future<Response> Master::Http::_reserve(
     return BadRequest("No agent found with specified ID");
   }
 
-  // Create an offer operation.
+  // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::RESERVE);
   operation.mutable_reserve()->mutable_resources()->CopyFrom(resources);
 
-  Option<Error> error = validateAndNormalizeResources(&operation);
+  Option<Error> error = validateAndUpgradeResources(&operation);
   if (error.isSome()) {
     return BadRequest(error->message);
   }
@@ -2592,7 +2593,7 @@ Future<process::http::Response> Master::Http::getAgents(
             -> Future<process::http::Response> {
           mesos::master::Response response;
           response.set_type(mesos::master::Response::GET_AGENTS);
-          response.mutable_get_agents()->CopyFrom(_getAgents(rolesAcceptor));
+          *response.mutable_get_agents() = _getAgents(rolesAcceptor);
 
           return OK(serialize(contentType, evolve(response)),
                     stringify(contentType));
@@ -2606,8 +2607,18 @@ mesos::master::Response::GetAgents Master::Http::_getAgents(
   mesos::master::Response::GetAgents getAgents;
   foreachvalue (const Slave* slave, master->slaves.registered) {
     mesos::master::Response::GetAgents::Agent* agent = getAgents.add_agents();
-    agent->CopyFrom(
-        protobuf::master::event::createAgentResponse(*slave, rolesAcceptor));
+    *agent = protobuf::master::event::createAgentResponse(
+        *slave, rolesAcceptor);
+
+    foreachvalue (
+        const ResourceProviderInfo& resourceProviderInfo,
+        slave->resourceProviders) {
+      mesos::master::Response::GetAgents::Agent::ResourceProvider*
+        resourceProvider = agent->add_resource_providers();
+
+      resourceProvider->mutable_resource_provider_info()->CopyFrom(
+          resourceProviderInfo);
+    }
   }
 
   foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
@@ -4173,9 +4184,8 @@ Future<Response> Master::Http::getTasks(
       mesos::master::Response response;
       response.set_type(mesos::master::Response::GET_TASKS);
 
-      response.mutable_get_tasks()->CopyFrom(
-          _getTasks(frameworksApprover,
-                    tasksApprover));
+      *response.mutable_get_tasks() =
+        _getTasks(frameworksApprover, tasksApprover);
 
       return OK(serialize(contentType, evolve(response)),
                 stringify(contentType));
@@ -4219,10 +4229,8 @@ mesos::master::Response::GetTasks Master::Http::_getTasks(
         continue;
       }
 
-      const Task& task =
+      *getTasks.add_pending_tasks() =
         protobuf::createTask(taskInfo, TASK_STAGING, framework->id());
-
-      getTasks.add_pending_tasks()->CopyFrom(task);
     }
 
     // Active tasks.
@@ -4448,8 +4456,8 @@ Future<Response> Master::Http::__updateMaintenanceSchedule(
     }
   }
 
-  return master->registrar
-    ->apply(Owned<Operation>(new maintenance::UpdateSchedule(schedule)))
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new maintenance::UpdateSchedule(schedule)))
     .then(defer(master->self(), [this, schedule](bool result) {
       return ___updateMaintenanceSchedule(schedule, result);
     }));
@@ -4558,8 +4566,8 @@ Future<Response> Master::Http::getMaintenanceSchedule(
 
         response.set_type(mesos::master::Response::GET_MAINTENANCE_SCHEDULE);
 
-        response.mutable_get_maintenance_schedule()->mutable_schedule()
-          ->CopyFrom(_getMaintenanceSchedule(approver));
+        *response.mutable_get_maintenance_schedule()->mutable_schedule() =
+          _getMaintenanceSchedule(approver);
 
         return OK(serialize(contentType, evolve(response)),
                   stringify(contentType));
@@ -4686,7 +4694,7 @@ Future<Response> Master::Http::_startMaintenance(
     }
   }
 
-  return master->registrar->apply(Owned<Operation>(
+  return master->registrar->apply(Owned<RegistryOperation>(
       new maintenance::StartMaintenance(machineIds)))
     .then(defer(master->self(), [=](bool result) -> Future<Response> {
       // See the top comment in "master/maintenance.hpp" for why this check
@@ -4866,7 +4874,7 @@ Future<Response> Master::Http::_stopMaintenance(
     }
   }
 
-  return master->registrar->apply(Owned<Operation>(
+  return master->registrar->apply(Owned<RegistryOperation>(
       new maintenance::StopMaintenance(machineIds)))
     .then(defer(master->self(), [=](bool result) -> Future<Response> {
       // See the top comment in "master/maintenance.hpp" for why this check
@@ -5232,12 +5240,12 @@ Future<Response> Master::Http::_unreserve(
     return BadRequest("No agent found with specified ID");
   }
 
-  // Create an offer operation.
+  // Create an operation.
   Offer::Operation operation;
   operation.set_type(Offer::Operation::UNRESERVE);
   operation.mutable_unreserve()->mutable_resources()->CopyFrom(resources);
 
-  Option<Error> error = validateAndNormalizeResources(&operation);
+  Option<Error> error = validateAndUpgradeResources(&operation);
   if (error.isSome()) {
     return BadRequest(error->message);
   }
@@ -5434,7 +5442,7 @@ Future<Response> Master::Http::_markAgentGone(const SlaveID& slaveId) const
 
   TimeInfo goneTime = protobuf::getCurrentTime();
 
-  Future<bool> gone = master->registrar->apply(Owned<Operation>(
+  Future<bool> gone = master->registrar->apply(Owned<RegistryOperation>(
       new MarkSlaveGone(slaveId, goneTime)));
 
   gone.onAny(defer(

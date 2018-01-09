@@ -51,6 +51,13 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
+// If the container class is not of type `DEBUG` (i.e., it is not set or
+// `DEFAULT`), we log the line at the INFO level. Otherwise, we use VLOG(1).
+// The purpose of this macro is to avoid polluting agent logs with information
+// related to `DEBUG` containers as this type of container can run periodically.
+#define LOG_BASED_ON_CLASS(containerClass) \
+  LOG_IF(INFO, (containerClass != ContainerClass::DEBUG) || VLOG_IS_ON(1))
+
 // Forward declaration.
 class MesosContainerizerProcess;
 
@@ -111,7 +118,8 @@ public:
 
   virtual process::Future<Nothing> remove(const ContainerID& containerId);
 
-  virtual process::Future<Nothing> pruneImages();
+  virtual process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages);
 
 private:
   explicit MesosContainerizer(
@@ -183,7 +191,8 @@ public:
 
   virtual process::Future<hashset<ContainerID>> containers();
 
-  virtual process::Future<Nothing> pruneImages();
+  virtual process::Future<Nothing> pruneImages(
+      const std::vector<Image>& excludedImages);
 
 private:
   enum State
@@ -348,10 +357,14 @@ private:
 
     // The configuration for the container to be launched.
     // This can only be None if the underlying container is launched
-    // before we checkpiont `ContainerConfig` in MESOS-6894.
+    // before we checkpoint `ContainerConfig` in MESOS-6894.
     // TODO(zhitao): Drop the `Option` part at the end of deprecation
     // cycle.
     Option<mesos::slave::ContainerConfig> config;
+
+    // The container class that can be `DEFAULT` or `DEBUG`.
+    // Returns `DEFAULT` even if the container class is not defined.
+    mesos::slave::ContainerClass containerClass();
 
     // Container's information at the moment it was launched. For example,
     // used to bootstrap the launch information of future child DEBUG
@@ -379,6 +392,12 @@ private:
 
   // Helper to transition container state.
   void transition(const ContainerID& containerId, const State& state);
+
+  // Helper to determine if a container is supported by an isolator.
+  bool isSupportedByIsolator(
+      const ContainerID& containerId,
+      bool isolatorSupportsNesting,
+      bool isolatorSupportsStandalone);
 
   struct Metrics
   {

@@ -23,3 +23,26 @@ add_subdirectory(resource_estimators)
 #######################
 add_executable(mesos-agent main.cpp)
 target_link_libraries(mesos-agent PRIVATE mesos)
+
+# Add binary dependencies
+add_dependencies(
+  mesos-agent
+  mesos-containerizer
+  mesos-default-executor
+  mesos-docker-executor
+  mesos-executor
+  mesos-fetcher
+  mesos-tcp-connect
+  mesos-usage)
+
+if (WIN32)
+  # NOTE: The agent depends on `curl` on non-Windows platforms too, but not as
+  # part of the build. This is necessary because we use CMake to deploy
+  # `curl.exe` on Windows for use in the HTTP health checks.
+  add_dependencies(mesos-agent curl)
+else ()
+  add_dependencies(
+    mesos-agent
+    mesos-cni-port-mapper
+    mesos-io-switchboard)
+endif ()

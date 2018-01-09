@@ -107,7 +107,7 @@ StatusUpdate createStatusUpdate(
     const TaskID& taskId,
     const TaskState& state,
     const TaskStatus::Source& source,
-    const Option<UUID>& uuid,
+    const Option<id::UUID>& uuid,
     const string& message,
     const Option<TaskStatus::Reason>& reason,
     const Option<ExecutorID>& executorId,
@@ -234,7 +234,7 @@ StatusUpdate createStatusUpdate(
 TaskStatus createTaskStatus(
     const TaskID& taskId,
     const TaskState& state,
-    const UUID& uuid,
+    const id::UUID& uuid,
     double timestamp)
 {
   TaskStatus status;
@@ -250,7 +250,7 @@ TaskStatus createTaskStatus(
 
 TaskStatus createTaskStatus(
     TaskStatus status,
-    const UUID& uuid,
+    const id::UUID& uuid,
     double timestamp,
     const Option<TaskState>& state,
     const Option<string>& message,
@@ -398,15 +398,16 @@ Option<ContainerStatus> getTaskContainerStatus(const Task& task)
 }
 
 
-bool isTerminalState(const OfferOperationState& state)
+bool isTerminalState(const OperationState& state)
 {
   switch (state) {
-    case OFFER_OPERATION_FINISHED:
-    case OFFER_OPERATION_FAILED:
-    case OFFER_OPERATION_ERROR:
+    case OPERATION_FINISHED:
+    case OPERATION_FAILED:
+    case OPERATION_ERROR:
+    case OPERATION_DROPPED:
       return true;
-    case OFFER_OPERATION_PENDING:
-    case OFFER_OPERATION_UNSUPPORTED:
+    case OPERATION_PENDING:
+    case OPERATION_UNSUPPORTED:
       return false;
   }
 
@@ -414,14 +415,14 @@ bool isTerminalState(const OfferOperationState& state)
 }
 
 
-OfferOperationStatus createOfferOperationStatus(
-    const OfferOperationState& state,
-    const Option<OfferOperationID>& operationId,
+OperationStatus createOperationStatus(
+    const OperationState& state,
+    const Option<OperationID>& operationId,
     const Option<string>& message,
     const Option<Resources>& convertedResources,
-    const Option<UUID>& statusUUID)
+    const Option<id::UUID>& uuid)
 {
-  OfferOperationStatus status;
+  OperationStatus status;
   status.set_state(state);
 
   if (operationId.isSome()) {
@@ -436,22 +437,22 @@ OfferOperationStatus createOfferOperationStatus(
     status.mutable_converted_resources()->CopyFrom(convertedResources.get());
   }
 
-  if (statusUUID.isSome()) {
-    status.set_status_uuid(statusUUID->toBytes());
+  if (uuid.isSome()) {
+    status.mutable_uuid()->set_value(uuid->toBytes());
   }
 
   return status;
 }
 
 
-OfferOperation createOfferOperation(
+Operation createOperation(
     const Offer::Operation& info,
-    const OfferOperationStatus& latestStatus,
+    const OperationStatus& latestStatus,
     const Option<FrameworkID>& frameworkId,
     const Option<SlaveID>& slaveId,
-    const Option<UUID>& operationUUID)
+    const Option<id::UUID>& operationUUID)
 {
-  OfferOperation operation;
+  Operation operation;
   if (frameworkId.isSome()) {
     operation.mutable_framework_id()->CopyFrom(frameworkId.get());
   }
@@ -461,23 +462,23 @@ OfferOperation createOfferOperation(
   operation.mutable_info()->CopyFrom(info);
   operation.mutable_latest_status()->CopyFrom(latestStatus);
   if (operationUUID.isSome()) {
-    operation.set_operation_uuid(operationUUID->toBytes());
+    operation.mutable_uuid()->set_value(operationUUID->toBytes());
   } else {
-    operation.set_operation_uuid(UUID::random().toBytes());
+    operation.mutable_uuid()->set_value(id::UUID::random().toBytes());
   }
 
   return operation;
 }
 
 
-OfferOperationStatusUpdate createOfferOperationStatusUpdate(
-    const UUID& operationUUID,
-    const OfferOperationStatus& status,
-    const Option<OfferOperationStatus>& latestStatus,
+UpdateOperationStatusMessage createUpdateOperationStatusMessage(
+    const id::UUID& operationUUID,
+    const OperationStatus& status,
+    const Option<OperationStatus>& latestStatus,
     const Option<FrameworkID>& frameworkId,
     const Option<SlaveID>& slaveId)
 {
-  OfferOperationStatusUpdate update;
+  UpdateOperationStatusMessage update;
   if (frameworkId.isSome()) {
     update.mutable_framework_id()->CopyFrom(frameworkId.get());
   }
@@ -488,7 +489,7 @@ OfferOperationStatusUpdate createOfferOperationStatusUpdate(
   if (latestStatus.isSome()) {
     update.mutable_latest_status()->CopyFrom(latestStatus.get());
   }
-  update.set_operation_uuid(operationUUID.toBytes());
+  update.mutable_operation_uuid()->set_value(operationUUID.toBytes());
 
   return update;
 }
@@ -513,7 +514,7 @@ OfferOperationStatusUpdate createOfferOperationStatusUpdate(
 MasterInfo createMasterInfo(const UPID& pid)
 {
   MasterInfo info;
-  info.set_id(stringify(pid) + "-" + UUID::random().toString());
+  info.set_id(stringify(pid) + "-" + id::UUID::random().toString());
 
   // NOTE: Currently, we store the ip in network order, which should
   // be fixed. See MESOS-1201 for more details.
@@ -855,30 +856,30 @@ bool isSpeculativeOperation(const Offer::Operation& operation)
 
 
 RepeatedPtrField<ResourceVersionUUID> createResourceVersions(
-    const hashmap<Option<ResourceProviderID>, UUID>& resourceVersions)
+    const hashmap<Option<ResourceProviderID>, id::UUID>& resourceVersions)
 {
   RepeatedPtrField<ResourceVersionUUID> result;
 
   foreachpair (
       const Option<ResourceProviderID>& resourceProviderId,
-      const UUID& uuid,
+      const id::UUID& uuid,
       resourceVersions) {
     ResourceVersionUUID* entry = result.Add();
 
     if (resourceProviderId.isSome()) {
       entry->mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
     }
-    entry->set_uuid(uuid.toBytes());
+    entry->mutable_uuid()->set_value(uuid.toBytes());
   }
 
   return result;
 }
 
 
-hashmap<Option<ResourceProviderID>, UUID> parseResourceVersions(
+hashmap<Option<ResourceProviderID>, id::UUID> parseResourceVersions(
     const RepeatedPtrField<ResourceVersionUUID>& resourceVersionUUIDs)
 {
-  hashmap<Option<ResourceProviderID>, UUID> result;
+  hashmap<Option<ResourceProviderID>, id::UUID> result;
 
   foreach (
       const ResourceVersionUUID& resourceVersionUUID,
@@ -890,7 +891,8 @@ hashmap<Option<ResourceProviderID>, UUID> parseResourceVersions(
 
     CHECK(!result.contains(resourceProviderId));
 
-    const Try<UUID> uuid = UUID::fromBytes(resourceVersionUUID.uuid());
+    const Try<id::UUID> uuid =
+      id::UUID::fromBytes(resourceVersionUUID.uuid().value());
     CHECK_SOME(uuid);
 
     result.insert({std::move(resourceProviderId), std::move(uuid.get())});

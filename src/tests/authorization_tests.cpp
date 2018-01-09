@@ -5375,6 +5375,181 @@ TYPED_TEST(AuthorizationTest, GetMaintenanceStatus)
   }
 }
 
+
+// This tests the authorization of requests to ViewStandaloneContainer.
+TYPED_TEST(AuthorizationTest, ViewStandaloneContainer)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can view standalone containers on agents.
+    mesos::ACL::ViewStandaloneContainer* acl =
+      acls.add_view_standalone_containers();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can view standalone containers.
+    mesos::ACL::ViewStandaloneContainer* acl =
+      acls.add_view_standalone_containers();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to view standalone containers. The request
+    // should succeed.
+    authorization::Request request;
+    request.set_action(authorization::VIEW_STANDALONE_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to view standalone containers. The
+    // request should fail.
+    authorization::Request request;
+    request.set_action(authorization::VIEW_STANDALONE_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::ViewStandaloneContainer* acl =
+      invalid.add_view_standalone_containers();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
+// This tests the authorization of requests to ModifyResourceProviderConfig.
+TYPED_TEST(AuthorizationTest, ModifyResourceProviderConfig)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can modify resource provider configs on agents.
+    mesos::ACL::ModifyResourceProviderConfig* acl =
+      acls.add_modify_resource_provider_configs();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_resource_providers()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can modify resource provider configs.
+    mesos::ACL::ModifyResourceProviderConfig* acl =
+      acls.add_modify_resource_provider_configs();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_resource_providers()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to modify resource provider configs. The request
+    // should succeed.
+    authorization::Request request;
+    request.set_action(authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to modify resource provider configs. The
+    // request should fail.
+    authorization::Request request;
+    request.set_action(authorization::MODIFY_RESOURCE_PROVIDER_CONFIG);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::ModifyResourceProviderConfig* acl =
+      invalid.add_modify_resource_provider_configs();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_resource_providers()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
+// This tests the authorization of requests to prune images.
+TYPED_TEST(AuthorizationTest, PruneImages)
+{
+  ACLs acls;
+
+  {
+    // "foo" principal can prune any images.
+    mesos::ACL::PruneImages* acl = acls.add_prune_images();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_images()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can prune images.
+    mesos::ACL::PruneImages* acl = acls.add_prune_images();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_images()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    // "foo" is allowed to prune images. This request should succeed.
+    authorization::Request request;
+    request.set_action(authorization::PRUNE_IMAGES);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer->authorized(request));
+  }
+
+  {
+    // "bar" is not allowed to prune images. The request should fail.
+    authorization::Request request;
+    request.set_action(authorization::PRUNE_IMAGES);
+    request.mutable_subject()->set_value("bar");
+
+    AWAIT_EXPECT_FALSE(authorizer->authorized(request));
+  }
+
+  {
+    // Test that no authorizer is created with invalid ACLs.
+    ACLs invalid;
+
+    mesos::ACL::PruneImages* acl = invalid.add_prune_images();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_images()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
 } // namespace tests {
 } // namespace internal {
 } // namespace mesos {

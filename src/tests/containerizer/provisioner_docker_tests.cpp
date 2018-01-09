@@ -31,7 +31,7 @@
 
 #ifdef __linux__
 #include "linux/fs.hpp"
-#endif
+#endif // __linux__
 
 #include "slave/containerizer/mesos/provisioner/constants.hpp"
 #include "slave/containerizer/mesos/provisioner/paths.hpp"
@@ -442,7 +442,7 @@ TEST_F(ProvisionerDockerTest, ROOT_LocalPullerSimpleCommand)
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(task.task_id(), statusStarting->task_id());
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
@@ -468,8 +468,10 @@ INSTANTIATE_TEST_CASE_P(
     ::testing::ValuesIn(vector<string>({
         "alpine", // Verifies the normalization of the Docker repository name.
         "library/alpine",
-        "quay.io/coreos/alpine-sh",
-        "registry.cn-hangzhou.aliyuncs.com/acs-sample/alpine"})));
+        // TODO(alexr): The registry below is unreliable and hence disabled.
+        // Consider re-enabling shall it become more stable.
+        // "registry.cn-hangzhou.aliyuncs.com/acs-sample/alpine",
+        "quay.io/coreos/alpine-sh"})));
 
 
 // TODO(jieyu): This is a ROOT test because of MESOS-4757. Remove the
@@ -622,7 +624,7 @@ TEST_F(ProvisionerDockerTest, ROOT_INTERNET_CURL_ScratchImage)
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(task.task_id(), statusStarting->task_id());
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
@@ -1064,11 +1066,11 @@ TEST_F(ProvisionerDockerTest, ROOT_RecoverNestedOnReboot)
   ASSERT_SOME(provisioner);
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ContainerID nestedContainerId;
   nestedContainerId.mutable_parent()->CopyFrom(containerId);
-  nestedContainerId.set_value(UUID::random().toString());
+  nestedContainerId.set_value(id::UUID::random().toString());
 
   Image image;
   image.set_type(Image::DOCKER);
@@ -1087,7 +1089,7 @@ TEST_F(ProvisionerDockerTest, ROOT_RecoverNestedOnReboot)
   EXPECT_FALSE(os::exists(containerDir));
 }
 
-#endif
+#endif // __linux__
 
 } // namespace tests {
 } // namespace internal {

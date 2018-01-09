@@ -263,7 +263,7 @@ TEST_F(NvidiaGpuTest, ROOT_INTERNET_CURL_CGROUPS_NVIDIA_GPU_NvidiaDockerImage)
   // We wait wait up to 120 seconds
   // to download the docker image.
   AWAIT_READY_FOR(statusStarting1, Seconds(120));
-  ASSERT_EQ(TASK_RUNNING, statusRunning1->state());
+  ASSERT_EQ(TASK_STARTING, statusStarting1->state());
 
   AWAIT_READY_FOR(statusRunning1, Seconds(120));
   ASSERT_EQ(TASK_RUNNING, statusRunning1->state());
@@ -293,7 +293,7 @@ TEST_F(NvidiaGpuTest, ROOT_INTERNET_CURL_CGROUPS_NVIDIA_GPU_NvidiaDockerImage)
 
   driver.launchTasks(offers2->at(0).id(), {task2});
 
-  AWAIT_READY(statusStarting2);
+  AWAIT_READY_FOR(statusStarting2, Seconds(120));
   ASSERT_EQ(TASK_STARTING, statusStarting2->state());
 
   AWAIT_READY_FOR(statusRunning2, Seconds(120));
@@ -679,14 +679,6 @@ TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_DefaultExecutorVerifyDeviceAccess)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "filesystem/linux,cgroups/devices,gpu/nvidia";
   flags.resources = "cpus:1"; // To override the default with gpus:0.
-
-#ifndef USE_SSL_SOCKET
-  // Disable operator API authentication for the default executor. Executor
-  // authentication currently has SSL as a dependency, so we cannot require
-  // executors to authenticate with the agent operator API if Mesos was not
-  // built with SSL support.
-  flags.authenticate_http_readwrite = false;
-#endif // USE_SSL_SOCKET
 
   Owned<MasterDetector> detector = master.get()->createDetector();
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);

@@ -117,7 +117,10 @@ private:
   // Helper function to collect containers status and resource statistics.
   process::Future<JSON::Array> __containers(
       process::Owned<AuthorizationAcceptor> authorizeContainer,
-      Option<IDAcceptor<ContainerID>> selectContainerId) const;
+      process::Owned<AuthorizationAcceptor> authorizeStandaloneContainer,
+      Option<IDAcceptor<ContainerID>> selectContainerId,
+      bool showNestedContainers,
+      bool showStandaloneContainers) const;
 
   // Helper routines for endpoint authorization.
   Try<std::string> extractEndpoint(const process::http::URL& url) const;
@@ -196,6 +199,11 @@ private:
       const process::Owned<ObjectApprover>& executorsApprover) const;
 
   process::Future<process::http::Response> getAgent(
+      const mesos::agent::Call& call,
+      ContentType acceptType,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  process::Future<process::http::Response> getResourceProviders(
       const mesos::agent::Call& call,
       ContentType acceptType,
       const Option<process::http::authentication::Principal>& principal) const;
@@ -300,6 +308,24 @@ private:
   process::Future<process::http::Response> _attachContainerOutput(
       const mesos::agent::Call& call,
       const RequestMediaTypes& mediaTypes) const;
+
+  process::Future<process::http::Response> addResourceProviderConfig(
+      const mesos::agent::Call& call,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  process::Future<process::http::Response> updateResourceProviderConfig(
+      const mesos::agent::Call& call,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  process::Future<process::http::Response> removeResourceProviderConfig(
+      const mesos::agent::Call& call,
+      const Option<process::http::authentication::Principal>& principal) const;
+
+  process::Future<process::http::Response> pruneImages(
+      const mesos::agent::Call& call,
+      ContentType acceptType,
+      const Option<process::http::authentication::Principal>&
+          principal) const;
 
   Slave* slave;
 

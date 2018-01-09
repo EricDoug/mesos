@@ -133,7 +133,7 @@ TEST_F(DockerRuntimeIsolatorTest, ROOT_DockerDefaultCmdLocalPuller)
 
   TaskInfo task;
   task.set_name("test-task");
-  task.mutable_task_id()->set_value(UUID::random().toString());
+  task.mutable_task_id()->set_value(id::UUID::random().toString());
   task.mutable_slave_id()->CopyFrom(offer.slave_id());
   task.mutable_resources()->CopyFrom(Resources::parse("cpus:1;mem:128").get());
   task.mutable_command()->set_shell(false);
@@ -158,7 +158,7 @@ TEST_F(DockerRuntimeIsolatorTest, ROOT_DockerDefaultCmdLocalPuller)
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(task.task_id(), statusStarting->task_id());
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
@@ -223,7 +223,7 @@ TEST_F(DockerRuntimeIsolatorTest, ROOT_DockerDefaultEntryptLocalPuller)
 
   TaskInfo task;
   task.set_name("test-task");
-  task.mutable_task_id()->set_value(UUID::random().toString());
+  task.mutable_task_id()->set_value(id::UUID::random().toString());
   task.mutable_slave_id()->CopyFrom(offer.slave_id());
   task.mutable_resources()->CopyFrom(Resources::parse("cpus:1;mem:128").get());
   task.mutable_command()->set_shell(false);
@@ -303,7 +303,7 @@ TEST_F(DockerRuntimeIsolatorTest,
 
   TaskInfo task;
   task.set_name("test-task");
-  task.mutable_task_id()->set_value(UUID::random().toString());
+  task.mutable_task_id()->set_value(id::UUID::random().toString());
   task.mutable_slave_id()->CopyFrom(offer.slave_id());
   task.mutable_resources()->CopyFrom(Resources::parse("cpus:1;mem:128").get());
   task.mutable_command()->set_shell(false);
@@ -330,7 +330,7 @@ TEST_F(DockerRuntimeIsolatorTest,
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(statusStarting);
+  AWAIT_READY_FOR(statusStarting, Seconds(60));
   EXPECT_EQ(task.task_id(), statusStarting->task_id());
   EXPECT_EQ(TASK_STARTING, statusStarting->state());
 

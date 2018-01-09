@@ -227,7 +227,7 @@ public:
 
         // Launch a standalone parent container.
         v1::ContainerID containerId;
-        containerId.set_value(UUID::random().toString());
+        containerId.set_value(id::UUID::random().toString());
 
         v1::agent::Call call;
         call.set_type(v1::agent::Call::LAUNCH_CONTAINER);
@@ -421,6 +421,17 @@ public:
     return post(slave, call);
   }
 
+  Future<http::Response> getContainers(
+      const process::PID<slave::Slave>& slave)
+  {
+    v1::agent::Call call;
+    call.set_type(v1::agent::Call::GET_CONTAINERS);
+    call.mutable_get_containers()->set_show_nested(true);
+    call.mutable_get_containers()->set_show_standalone(true);
+
+    return post(slave, call);
+  }
+
 protected:
   virtual void TearDown()
   {
@@ -510,7 +521,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentContainerAPITest, NestedContainerLaunch)
 
   // Launch a nested container and wait for it to finish.
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -554,7 +565,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentContainerAPITest, RecoverNestedContainer)
 
   // Launch a nested container.
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -608,8 +619,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentContainerAPITest, NestedContainerNotFound)
   AWAIT_READY(slaveRegisteredMessage);
 
   v1::ContainerID unknownContainerId;
-  unknownContainerId.set_value(UUID::random().toString());
-  unknownContainerId.mutable_parent()->set_value(UUID::random().toString());
+  unknownContainerId.set_value(id::UUID::random().toString());
+  unknownContainerId.mutable_parent()->set_value(id::UUID::random().toString());
 
   // Expect a 404 for waiting on unknown containers.
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -648,7 +659,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   // Launch a nested container that needs to fetch a URI that
   // doesn't exist. The launch should therefore fail.
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   mesos::v1::CommandInfo commandInfo;
@@ -689,7 +700,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   // the Docker containerizer, even though the parent was made with
   // the Mesos containerizer.
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   mesos::v1::ContainerInfo containerInfo;
@@ -727,7 +738,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   // Launch the first nested container and wait for it to finish.
   v1::ContainerID childContainerId;
-  childContainerId.set_value(UUID::random().toString());
+  childContainerId.set_value(id::UUID::random().toString());
   childContainerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -737,7 +748,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   // Launch the second nested container underneath the first nested contaienr
   // and wait for it to finish.
   v1::ContainerID grandchildContainerId;
-  grandchildContainerId.set_value(UUID::random().toString());
+  grandchildContainerId.set_value(id::UUID::random().toString());
   grandchildContainerId.mutable_parent()->CopyFrom(childContainerId);
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -800,7 +811,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   // Launch a nested container and wait for it to finish.
   v1::ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   containerId.mutable_parent()->CopyFrom(parentContainerId.get());
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
@@ -834,6 +845,43 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   AWAIT_READY(wait);
   EXPECT_TRUE(checkWaitContainerResponse(wait, SIGKILL));
+}
+
+
+// This test verifies the GET_CONTAINERS API call.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentContainerAPITest, GetContainers)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.launcher = std::get<1>(std::get<3>(GetParam()));
+  slaveFlags.isolation = std::get<0>(std::get<3>(GetParam()));
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Try<v1::ContainerID> parentContainerId =
+    launchParentContainer(master.get()->pid, slave.get()->pid);
+
+  ASSERT_SOME(parentContainerId);
+
+  // Launch a nested container and wait for it to finish.
+  v1::ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+  containerId.mutable_parent()->CopyFrom(parentContainerId.get());
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      http::OK().status,
+      launchNestedContainer(slave.get()->pid, containerId));
+
+  Future<v1::agent::Response> response =
+    deserialize(getContainers(slave.get()->pid));
+
+  ASSERT_EQ(v1::agent::Response::GET_CONTAINERS, response->type());
+  EXPECT_EQ(2, response->get_containers().containers_size());
 }
 
 } // namespace tests {

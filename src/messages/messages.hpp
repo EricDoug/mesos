@@ -45,12 +45,32 @@ bool operator!=(
     const ResourceVersionUUID& right);
 
 
+bool operator==(
+    const UpdateOperationStatusMessage& left,
+    const UpdateOperationStatusMessage& right);
+
+
+bool operator!=(
+    const UpdateOperationStatusMessage& left,
+    const UpdateOperationStatusMessage& right);
+
+
 std::ostream& operator<<(std::ostream& stream, const StatusUpdate& update);
 
 
 std::ostream& operator<<(
     std::ostream& stream,
+    const UpdateOperationStatusMessage& update);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
     const StatusUpdateRecord::Type& type);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const UpdateOperationStatusRecord::Type& type);
 
 } // namespace internal {
 } // namespace mesos {

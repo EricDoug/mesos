@@ -36,6 +36,10 @@
 
 #include <mesos/module/authenticatee.hpp>
 
+#ifdef ENABLE_GRPC
+#include <mesos/resource_provider/storage/volume_profile.hpp>
+#endif
+
 #include <process/after.hpp>
 #include <process/async.hpp>
 #include <process/check.hpp>
@@ -90,8 +94,11 @@
 
 #include "logging/logging.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "module/manager.hpp"
 
+#include "slave/compatibility.hpp"
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
 #include "slave/paths.hpp"
@@ -219,7 +226,7 @@ Slave::Slave(const string& id,
     qosController(_qosController),
     secretGenerator(_secretGenerator),
     authorizer(_authorizer),
-    resourceVersions({{Option<ResourceProviderID>::none(), UUID::random()}}) {}
+    resourceVersion(id::UUID::random()) {}
 
 
 Slave::~Slave()
@@ -415,6 +422,24 @@ void Slave::initialize()
       << "Failed to create agent work directory '" << flags.work_dir << "': "
       << mkdir.error();
   }
+
+#ifdef ENABLE_GRPC
+  // Create the VolumeProfileAdaptor module and set it globally so
+  // any component that needs the module can share this instance.
+  Try<VolumeProfileAdaptor*> _volumeProfileAdaptor =
+    VolumeProfileAdaptor::create(flags.volume_profile_adaptor);
+
+  if (_volumeProfileAdaptor.isError()) {
+    EXIT(EXIT_FAILURE)
+      << "Failed to create volume profile adaptor: "
+      << _volumeProfileAdaptor.error();
+  }
+
+  volumeProfileAdaptor =
+    shared_ptr<VolumeProfileAdaptor>(_volumeProfileAdaptor.get());
+
+  VolumeProfileAdaptor::setAdaptor(volumeProfileAdaptor);
+#endif
 
   string scheme = "http";
 
@@ -617,6 +642,21 @@ void Slave::initialize()
   // a very large disk_watch_interval).
   delay(flags.disk_watch_interval, self(), &Slave::checkDiskUsage);
 
+  // Start image store disk monitoring. Please note that image layers
+  // garbage collection is only enabled if the agent flag `--image_gc_config`
+  // is set.
+  // TODO(gilbert): Consider move the image auto GC logic to containerizers
+  // respectively. For now, it is only enabled for the Mesos Containerizer.
+  if (flags.image_gc_config.isSome() &&
+      flags.image_providers.isSome() &&
+      strings::contains(flags.containerizers, "mesos")) {
+    delay(
+        Nanoseconds(
+            flags.image_gc_config->image_disk_watch_interval().nanoseconds()),
+        self(),
+        &Slave::checkImageDiskUsage);
+  }
+
   startTime = Clock::now();
 
   // Install protobuf handlers.
@@ -636,13 +676,15 @@ void Slave::initialize()
       &RunTaskMessage::framework,
       &RunTaskMessage::framework_id,
       &RunTaskMessage::pid,
-      &RunTaskMessage::task);
+      &RunTaskMessage::task,
+      &RunTaskMessage::resource_version_uuids);
 
   install<RunTaskGroupMessage>(
       &Slave::runTaskGroup,
       &RunTaskGroupMessage::framework,
       &RunTaskGroupMessage::executor,
-      &RunTaskGroupMessage::task_group);
+      &RunTaskGroupMessage::task_group,
+      &RunTaskGroupMessage::resource_version_uuids);
 
   install<KillTaskMessage>(
       &Slave::killTask);
@@ -670,8 +712,11 @@ void Slave::initialize()
       &Slave::checkpointResourcesMessage,
       &CheckpointResourcesMessage::resources);
 
-  install<ApplyOfferOperationMessage>(
-      &Slave::applyOfferOperation);
+  install<ApplyOperationMessage>(
+      &Slave::applyOperation);
+
+  install<ReconcileOperationsMessage>(
+      &Slave::reconcileOperations);
 
   install<StatusUpdateAcknowledgementMessage>(
       &Slave::statusUpdateAcknowledgement,
@@ -680,8 +725,8 @@ void Slave::initialize()
       &StatusUpdateAcknowledgementMessage::task_id,
       &StatusUpdateAcknowledgementMessage::uuid);
 
-  install<OfferOperationUpdateAcknowledgementMessage>(
-      &Slave::offerOperationUpdateAcknowledgement);
+  install<AcknowledgeOperationStatusMessage>(
+      &Slave::operationStatusAcknowledgement);
 
   install<RegisterExecutorMessage>(
       &Slave::registerExecutor,
@@ -840,6 +885,15 @@ void Slave::initialize()
                      log.get(),
                      AGENT_LOG_VIRTUAL_PATH));
     }
+  }
+
+  // Check that the reconfiguration_policy flag is valid.
+  if (flags.reconfiguration_policy != "equal" &&
+      flags.reconfiguration_policy != "additive") {
+    EXIT(EXIT_FAILURE)
+      << "Unknown option for 'reconfiguration_policy' flag "
+      << flags.reconfiguration_policy << "."
+      << " Please run the agent with '--help' to see the valid options.";
   }
 
   // Check that the recover flag is valid.
@@ -1008,6 +1062,26 @@ void Slave::detected(const Future<Option<MasterInfo>>& _master)
     if (state == TERMINATING) {
       LOG(INFO) << "Skipping registration because agent is terminating";
       return;
+    }
+
+    if (requiredMasterCapabilities.agentUpdate) {
+      protobuf::master::Capabilities masterCapabilities(
+          latest->capabilities());
+
+      if (!masterCapabilities.agentUpdate) {
+        EXIT(EXIT_FAILURE) <<
+          "Agent state changed on restart, but the detected master lacks the "
+          "AGENT_UPDATE capability. Refusing to connect.";
+        return;
+      }
+
+      if (dynamic_cast<mesos::master::detector::StandaloneMasterDetector*>(
+          detector)) {
+        LOG(WARNING) <<
+          "The AGENT_UPDATE master capability is required, "
+          "but the StandaloneMasterDetector does not have the ability to read "
+          "master capabilities.";
+      }
     }
 
     // Wait for a random amount of time before authentication or
@@ -1220,17 +1294,7 @@ void Slave::registered(
 
       VLOG(1) << "Checkpointing SlaveInfo to '" << path << "'";
 
-      {
-        // The `SlaveInfo.resources` does not include dynamic reservations,
-        // which means it cannot contain reservation refinements, so
-        // `downgradeResources` should always succeed.
-        SlaveInfo info_ = info;
-
-        Try<Nothing> result = downgradeResources(info_.mutable_resources());
-        CHECK_SOME(result);
-
-        CHECK_SOME(state::checkpoint(path, info_));
-      }
+      CHECK_SOME(state::checkpoint(path, info));
 
       // We start the local resource providers daemon once the agent is
       // running, so the resource providers can use the agent API.
@@ -1269,45 +1333,14 @@ void Slave::registered(
       break;
   }
 
-  // Send the latest total, including resources from resource providers. We send
-  // this message here as a resource provider might have registered with the
-  // agent between recovery completion and agent registration.
-  bool sendUpdateSlaveMessage = false;
+  // If this agent can support resource providers or has had any oversubscribed
+  // resources set, send an `UpdateSlaveMessage` to the master to inform it of a
+  // possible changes between completion of recovery and agent registration.
+  if (capabilities.resourceProvider || oversubscribedResources.isSome()) {
+    UpdateSlaveMessage message = generateUpdateSlaveMessage();
 
-  UpdateSlaveMessage message;
-  message.mutable_slave_id()->CopyFrom(info.id());
-  message.mutable_resource_version_uuids()->CopyFrom(
-      protobuf::createResourceVersions(resourceVersions));
+    LOG(INFO) << "Forwarding agent update " << JSON::protobuf(message);
 
-  if (capabilities.resourceProvider) {
-    LOG(INFO) << "Forwarding total resources " << totalResources;
-
-    message.mutable_resource_categories()->set_total(true);
-    message.mutable_total_resources()->CopyFrom(totalResources);
-
-    UpdateSlaveMessage::OfferOperations* operations =
-      message.mutable_offer_operations();
-
-    foreachvalue (const OfferOperation* operation, offerOperations) {
-      operations->add_operations()->CopyFrom(*operation);
-    }
-
-    sendUpdateSlaveMessage = true;
-  }
-
-  // Send the latest estimate for oversubscribed resources.
-  if (oversubscribedResources.isSome()) {
-    LOG(INFO) << "Forwarding total oversubscribed resources "
-              << oversubscribedResources.get();
-
-    message.mutable_resource_categories()->set_oversubscribed(true);
-    message.mutable_oversubscribed_resources()->CopyFrom(
-        oversubscribedResources.get());
-
-    sendUpdateSlaveMessage = true;
-  }
-
-  if (sendUpdateSlaveMessage) {
     send(master.get(), message);
   }
 }
@@ -1381,46 +1414,13 @@ void Slave::reregistered(
       return;
   }
 
-  // Send the latest total, including resources from resource providers. We send
-  // this message here as a resource provider might have registered with the
-  // agent between recovery completion and agent registration.
-  bool sendUpdateSlaveMessage = false;
+  // If this agent can support resource providers or has had any oversubscribed
+  // resources set, send an `UpdateSlaveMessage` to the master to inform it of a
+  // possible changes between completion of recovery and agent registration.
+  if (capabilities.resourceProvider || oversubscribedResources.isSome()) {
+    UpdateSlaveMessage message = generateUpdateSlaveMessage();
 
-  UpdateSlaveMessage message;
-  message.mutable_slave_id()->CopyFrom(info.id());
-
-  message.mutable_resource_version_uuids()->CopyFrom(
-      protobuf::createResourceVersions(resourceVersions));
-
-  if (capabilities.resourceProvider) {
-    LOG(INFO) << "Forwarding total resources " << totalResources;
-
-    message.mutable_resource_categories()->set_total(true);
-    message.mutable_total_resources()->CopyFrom(totalResources);
-
-    UpdateSlaveMessage::OfferOperations* operations =
-      message.mutable_offer_operations();
-
-    foreachvalue (const OfferOperation* operation, offerOperations) {
-      operations->add_operations()->CopyFrom(*operation);
-    }
-
-    sendUpdateSlaveMessage = true;
-  }
-
-  // Send the latest estimate for oversubscribed resources.
-  if (oversubscribedResources.isSome()) {
-    LOG(INFO) << "Forwarding total oversubscribed resources "
-              << oversubscribedResources.get();
-
-    message.mutable_resource_categories()->set_oversubscribed(true);
-    message.mutable_oversubscribed_resources()->CopyFrom(
-        oversubscribedResources.get());
-
-    sendUpdateSlaveMessage = true;
-  }
-
-  if (sendUpdateSlaveMessage) {
+    LOG(INFO) << "Forwarding agent update " << JSON::protobuf(message);
     send(master.get(), message);
   }
 
@@ -1471,7 +1471,7 @@ void Slave::reregistered(
             taskId,
             taskState,
             TaskStatus::SOURCE_SLAVE,
-            UUID::random(),
+            id::UUID::random(),
             "Reconciliation: task unknown to the agent",
             TaskStatus::REASON_RECONCILIATION);
 
@@ -1521,42 +1521,30 @@ void Slave::doReliableRegistration(Duration maxBackoff)
   // See MESOS-5330.
   link(master.get());
 
-  SlaveInfo slaveInfo = info;
-
-  // The `SlaveInfo.resources` does not include dynamic reservations,
-  // which means it cannot contain reservation refinements, so
-  // `downgradeResources` should always succeed.
-  Try<Nothing> result = downgradeResources(slaveInfo.mutable_resources());
-  CHECK_SOME(result);
-
-  RepeatedPtrField<Resource> checkpointedResources_ = checkpointedResources;
-
-  // If the checkpointed resources don't have reservation refinements,
-  // send them to the master in "pre-reservation-refinement" format
-  // for backward compatibility with old masters. If downgrading is
-  // not possible without losing information, send the resources in
-  // the "post-reservation-refinement" format. We ignore the return
-  // value of `downgradeResources` because for now, we send the result
-  // either way.
-  //
-  // TODO(mpark): Do something smarter with the result once something
-  // like a master capability is introduced.
-  downgradeResources(&checkpointedResources_);
-
-  if (!slaveInfo.has_id()) {
+  if (!info.has_id()) {
     // Registering for the first time.
     RegisterSlaveMessage message;
     message.set_version(MESOS_VERSION);
-    message.mutable_slave()->CopyFrom(slaveInfo);
+    message.mutable_slave()->CopyFrom(info);
 
     message.mutable_agent_capabilities()->CopyFrom(
         capabilities.toRepeatedPtrField());
 
-    message.mutable_resource_version_uuids()->CopyFrom(
-        protobuf::createResourceVersions(resourceVersions));
-
     // Include checkpointed resources.
-    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources_);
+    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources);
+
+    message.mutable_resource_version_uuid()->set_value(
+        resourceVersion.toBytes());
+
+    // If the `Try` from `downgradeResources` returns an `Error`, we currently
+    // continue to send the resources to the master in a partially downgraded
+    // state. This implies that an agent with refined reservations cannot work
+    // with versions of master before reservation refinement support, which was
+    // introduced in 1.4.0.
+    //
+    // TODO(mpark): Do something smarter with the result once something
+    //              like a master capability is introduced.
+    downgradeResources(&message);
 
     send(master.get(), message);
   } else {
@@ -1567,13 +1555,13 @@ void Slave::doReliableRegistration(Duration maxBackoff)
     message.mutable_agent_capabilities()->CopyFrom(
         capabilities.toRepeatedPtrField());
 
-    message.mutable_resource_version_uuids()->CopyFrom(
-        protobuf::createResourceVersions(resourceVersions));
-
     // Include checkpointed resources.
-    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources_);
+    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources);
 
-    message.mutable_slave()->CopyFrom(slaveInfo);
+    message.mutable_resource_version_uuid()->set_value(
+        resourceVersion.toBytes());
+
+    message.mutable_slave()->CopyFrom(info);
 
     foreachvalue (Framework* framework, frameworks) {
       message.add_frameworks()->CopyFrom(framework->info);
@@ -1608,9 +1596,10 @@ void Slave::doReliableRegistration(Duration maxBackoff)
               task, TASK_STAGING, framework->id()));
         }
 
-        // Do not re-register with Command Executors because the
-        // master doesn't store them; they are generated by the slave.
-        if (!executor->isCommandExecutor()) {
+        // Do not re-register with Command (or Docker) Executors
+        // because the master doesn't store them; they are generated
+        // by the slave.
+        if (!executor->isGeneratedForCommandTask()) {
           // Ignore terminated executors because they do not consume
           // any resources.
           if (executor->state != Executor::TERMINATED) {
@@ -1660,29 +1649,15 @@ void Slave::doReliableRegistration(Duration maxBackoff)
       }
     }
 
-    // If the resources don't have reservation refinements, send them
-    // to the master in "pre-reservation-refinement" format for backward
-    // compatibility with old masters. If downgrading is not possible
-    // without losing information, send the resources in the
-    // "post-reservation-refinement" format. We ignore the return value of
-    // `downgradeResources` because for now, we send the result either way.
+    // If the `Try` from `downgradeResources` returns an `Error`, we currently
+    // continue to send the resources to the master in a partially downgraded
+    // state. This implies that an agent with refined reservations cannot work
+    // with versions of master before reservation refinement support, which was
+    // introduced in 1.4.0.
     //
     // TODO(mpark): Do something smarter with the result once something
     // like a master capability is introduced.
-    foreach (Task& task, *message.mutable_tasks()) {
-      downgradeResources(task.mutable_resources());
-    }
-
-    foreach (ExecutorInfo& executor, *message.mutable_executor_infos()) {
-      downgradeResources(executor.mutable_resources());
-    }
-
-    foreach (Archive::Framework& completedFramework,
-             *message.mutable_completed_frameworks()) {
-      foreach (Task& task, *completedFramework.mutable_tasks()) {
-        downgradeResources(task.mutable_resources());
-      }
-    }
+    downgradeResources(&message);
 
     CHECK_SOME(master);
     send(master.get(), message);
@@ -1713,7 +1688,8 @@ void Slave::runTask(
     const FrameworkInfo& frameworkInfo,
     const FrameworkID& frameworkId,
     const UPID& pid,
-    const TaskInfo& task)
+    const TaskInfo& task,
+    const vector<ResourceVersionUUID>& resourceVersionUuids)
 {
   CHECK_NE(task.has_executor(), task.has_command())
     << "Task " << task.task_id()
@@ -1734,7 +1710,7 @@ void Slave::runTask(
 
   const ExecutorInfo executorInfo = getExecutorInfo(frameworkInfo, task);
 
-  run(frameworkInfo, executorInfo, task, None(), pid);
+  run(frameworkInfo, executorInfo, task, None(), resourceVersionUuids, pid);
 }
 
 
@@ -1743,6 +1719,7 @@ void Slave::run(
     ExecutorInfo executorInfo,
     Option<TaskInfo> task,
     Option<TaskGroupInfo> taskGroup,
+    const vector<ResourceVersionUUID>& resourceVersionUuids,
     const UPID& pid)
 {
   CHECK_NE(task.isSome(), taskGroup.isSome())
@@ -1957,7 +1934,8 @@ void Slave::run(
                  frameworkInfo,
                  executorInfo,
                  task,
-                 taskGroup));
+                 taskGroup,
+                 resourceVersionUuids));
 }
 
 
@@ -1966,7 +1944,8 @@ void Slave::_run(
     const FrameworkInfo& frameworkInfo,
     const ExecutorInfo& executorInfo,
     const Option<TaskInfo>& task,
-    const Option<TaskGroupInfo>& taskGroup)
+    const Option<TaskGroupInfo>& taskGroup,
+    const std::vector<ResourceVersionUUID>& resourceVersionUuids)
 {
   // TODO(anindya_sinha): Consider refactoring the initial steps common
   // to `_run()` and `__run()`.
@@ -2060,7 +2039,7 @@ void Slave::_run(
           _task.task_id(),
           taskState,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           "Could not launch the task because we failed to unschedule"
           " directories scheduled for gc",
           TaskStatus::REASON_GC_ERROR);
@@ -2098,7 +2077,8 @@ void Slave::_run(
                  frameworkInfo,
                  executorInfo,
                  task,
-                 taskGroup));
+                 taskGroup,
+                 resourceVersionUuids));
 }
 
 
@@ -2107,7 +2087,8 @@ void Slave::__run(
     const FrameworkInfo& frameworkInfo,
     const ExecutorInfo& executorInfo,
     const Option<TaskInfo>& task,
-    const Option<TaskGroupInfo>& taskGroup)
+    const Option<TaskGroupInfo>& taskGroup,
+    const vector<ResourceVersionUUID>& resourceVersionUuids)
 {
   CHECK_NE(task.isSome(), taskGroup.isSome())
     << "Either task or task group should be set but not both";
@@ -2236,7 +2217,7 @@ void Slave::__run(
           _task.task_id(),
           TASK_ERROR,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           error->message,
           reason);
 
@@ -2252,14 +2233,93 @@ void Slave::__run(
     return;
   }
 
-  LOG(INFO) << "Launching " << taskOrTaskGroup(task, taskGroup)
-            << " for framework " << frameworkId;
+  // Check task invariants.
+  //
+  // TODO(bbannier): Instead of copy-pasting identical code to deal
+  // with cases where tasks need to be terminated, consolidate code
+  // below to decouple checking from terminating.
+
+  // If the master sent resource versions, perform a best-effort check
+  // that they are consistent with the resources the task uses.
+  //
+  // TODO(bbannier): Also check executor resources.
+  bool kill = false;
+  if (!resourceVersionUuids.empty()) {
+    hashset<Option<ResourceProviderID>> usedResourceProviderIds;
+    foreach (const TaskInfo& _task, tasks) {
+      foreach (const Resource& resource, _task.resources()) {
+        usedResourceProviderIds.insert(resource.has_provider_id()
+           ? Option<ResourceProviderID>(resource.provider_id())
+           : None());
+      }
+    }
+
+    const hashmap<Option<ResourceProviderID>, id::UUID>
+      receivedResourceVersions = protobuf::parseResourceVersions(
+          {resourceVersionUuids.begin(), resourceVersionUuids.end()});
+
+    foreach (const Option<ResourceProviderID>& resourceProviderId,
+             usedResourceProviderIds) {
+      if (resourceProviderId.isNone()) {
+        CHECK(receivedResourceVersions.contains(None()));
+
+        if (resourceVersion != receivedResourceVersions.at(None())) {
+          kill = true;
+        }
+      } else {
+        ResourceProvider* resourceProvider =
+          getResourceProvider(resourceProviderId.get());
+
+        if (resourceProvider == nullptr ||
+            resourceProvider->resourceVersion !=
+              receivedResourceVersions.at(resourceProviderId.get())) {
+          kill = true;
+        }
+      }
+    }
+  }
+
+  if (kill) {
+    // We report TASK_DROPPED to the framework because the task was
+    // never launched. For non-partition-aware frameworks, we report
+    // TASK_LOST for backward compatibility.
+    mesos::TaskState taskState = TASK_DROPPED;
+    if (!protobuf::frameworkHasCapability(
+            frameworkInfo, FrameworkInfo::Capability::PARTITION_AWARE)) {
+      taskState = TASK_LOST;
+    }
+
+    foreach (const TaskInfo& _task, tasks) {
+      const StatusUpdate update = protobuf::createStatusUpdate(
+          frameworkId,
+          info.id(),
+          _task.task_id(),
+          taskState,
+          TaskStatus::SOURCE_SLAVE,
+          id::UUID::random(),
+          "Tasks assumes outdated resource state",
+          TaskStatus::REASON_INVALID_OFFERS,
+          executorId);
+
+      statusUpdate(update, UPID());
+    }
+
+    // Refer to the comment after 'framework->removePendingTask' above
+    // for why we need this.
+    if (framework->idle()) {
+      removeFramework(framework);
+    }
+
+    return;
+  }
 
   auto unallocated = [](const Resources& resources) {
     Resources result = resources;
     result.unallocate();
     return result;
   };
+
+  CHECK_EQ(kill, false);
 
   // NOTE: If the task/task group or executor uses resources that are
   // checkpointed on the slave (e.g. persistent volumes), we should
@@ -2268,7 +2328,6 @@ void Slave::__run(
   // send TASK_DROPPED status updates here since restarting the task
   // may succeed in the event that CheckpointResourcesMessage arrives
   // out of order.
-  bool kill = false;
   foreach (const TaskInfo& _task, tasks) {
     // We must unallocate the resources to check whether they are
     // contained in the unallocated total checkpointed resources.
@@ -2304,7 +2363,7 @@ void Slave::__run(
           _task.task_id(),
           taskState,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           "The checkpointed resources being used by the task or task group are "
           "unknown to the agent",
           TaskStatus::REASON_RESOURCES_UNKNOWN);
@@ -2356,7 +2415,7 @@ void Slave::__run(
           _task.task_id(),
           taskState,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           "The checkpointed resources being used by the executor are unknown "
           "to the agent",
           TaskStatus::REASON_RESOURCES_UNKNOWN,
@@ -2396,6 +2455,9 @@ void Slave::__run(
   }
 
   CHECK(framework->state == Framework::RUNNING) << framework->state;
+
+  LOG(INFO) << "Launching " << taskOrTaskGroup(task, taskGroup)
+            << " for framework " << frameworkId;
 
   // Either send the task/task group to an executor or start a new executor
   // and queue it until the executor has started.
@@ -2456,7 +2518,7 @@ void Slave::__run(
             _task.task_id(),
             taskState,
             TaskStatus::SOURCE_SLAVE,
-            UUID::random(),
+            id::UUID::random(),
             "Executor " + executorState,
             TaskStatus::REASON_EXECUTOR_TERMINATED);
 
@@ -2504,9 +2566,12 @@ void Slave::__run(
       LOG(INFO) << "Queued " << taskOrTaskGroup(task, taskGroup)
                 << " for executor " << *executor;
 
-      containerizer->update(
-          executor->containerId,
-          executor->allocatedResources())
+      publishResources()
+        .then(defer(self(), [=] {
+          return containerizer->update(
+              executor->containerId,
+              executor->allocatedResources());
+        }))
         .onAny(defer(self(),
                      &Self::___run,
                      lambda::_1,
@@ -2906,20 +2971,28 @@ void Slave::launchExecutor(
     containerConfig.set_user(executor->user.get());
   }
 
-  if (executor->isCommandExecutor()) {
-    if (taskInfo.isSome()) {
-      containerConfig.mutable_task_info()->CopyFrom(taskInfo.get());
+  // For both of the following cases, `ExecutorInfo.container` is what
+  // we want to tell the containerizer about the container to be
+  // launched:
+  // (1) If this is a command task case (i.e., the framework specifies
+  //     the `TaskInfo` but not `ExecutorInfo`), the
+  //     `ExecutorInfo.container` is already copied from
+  //     `TaskInfo.container` in `Slave::getExecutorInfo`. As a
+  //     result, we should just inform the containerizer about
+  //     `ExecutorInfo.container`.
+  // (2) If this is a non command task (e.g., default executor, custom
+  //     executor), the `ExecutorInfo.container` is what we want to
+  //     tell the containerizer anyway.
+  if (executorInfo_.has_container()) {
+    containerConfig.mutable_container_info()
+      ->CopyFrom(executorInfo_.container());
+  }
 
-      if (taskInfo.get().has_container()) {
-        containerConfig.mutable_container_info()
-          ->CopyFrom(taskInfo.get().container());
-      }
-    }
-  } else {
-    if (executorInfo_.has_container()) {
-      containerConfig.mutable_container_info()
-        ->CopyFrom(executorInfo_.container());
-    }
+  if (executor->isGeneratedForCommandTask()) {
+    CHECK_SOME(taskInfo)
+      << "Command (or Docker) executor does not support task group";
+
+    containerConfig.mutable_task_info()->CopyFrom(taskInfo.get());
   }
 
   // Prepare environment variables for the executor.
@@ -2948,11 +3021,19 @@ void Slave::launchExecutor(
             << "' of framework " << framework->id();
 
   // Launch the container.
-  containerizer->launch(
-      executor->containerId,
-      containerConfig,
-      environment,
-      pidCheckpointPath)
+  // NOTE: Since we modify the ExecutorInfo to include the task's
+  // resources when launching the executor, these resources need to be
+  // published before the containerizer preparing them. This should be
+  // revisited after MESOS-600.
+  publishResources(
+      taskInfo.isSome() ? taskInfo->resources() : Option<Resources>::none())
+    .then(defer(self(), [=] {
+      return containerizer->launch(
+          executor->containerId,
+          containerConfig,
+          environment,
+          pidCheckpointPath);
+    }))
     .onAny(defer(self(),
                  &Self::executorLaunched,
                  frameworkId,
@@ -2976,7 +3057,8 @@ void Slave::runTaskGroup(
     const UPID& from,
     const FrameworkInfo& frameworkInfo,
     const ExecutorInfo& executorInfo,
-    const TaskGroupInfo& taskGroupInfo)
+    const TaskGroupInfo& taskGroupInfo,
+    const vector<ResourceVersionUUID>& resourceVersionUuids)
 {
   if (master != from) {
     LOG(WARNING) << "Ignoring run task group message from " << from
@@ -2998,7 +3080,13 @@ void Slave::runTaskGroup(
     return;
   }
 
-  run(frameworkInfo, executorInfo, None(), taskGroupInfo, UPID());
+  run(
+      frameworkInfo,
+      executorInfo,
+      None(),
+      taskGroupInfo,
+      resourceVersionUuids,
+      UPID());
 }
 
 
@@ -3075,7 +3163,7 @@ void Slave::killTask(
             task.task_id(),
             TASK_KILLED,
             TaskStatus::SOURCE_SLAVE,
-            UUID::random(),
+            id::UUID::random(),
             "A task within the task group was killed before"
             " delivery to the executor",
             TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
@@ -3089,7 +3177,7 @@ void Slave::killTask(
           taskId,
           TASK_KILLED,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           "Killed before delivery to the executor",
           TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
           CHECK_NOTNONE(
@@ -3127,7 +3215,7 @@ void Slave::killTask(
         taskId,
         taskState,
         TaskStatus::SOURCE_SLAVE,
-        UUID::random(),
+        id::UUID::random(),
         "Cannot find executor",
         TaskStatus::REASON_EXECUTOR_TERMINATED);
 
@@ -3154,7 +3242,7 @@ void Slave::killTask(
               task.task_id(),
               TASK_KILLED,
               TaskStatus::SOURCE_SLAVE,
-              UUID::random(),
+              id::UUID::random(),
               "A task within the task group was killed before"
               " delivery to the executor",
               TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
@@ -3167,7 +3255,7 @@ void Slave::killTask(
             taskId,
             TASK_KILLED,
             TaskStatus::SOURCE_SLAVE,
-            UUID::random(),
+            id::UUID::random(),
             "Killed before delivery to the executor",
             TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
             executor->id));
@@ -3212,7 +3300,7 @@ void Slave::killTask(
                 task.task_id(),
                 TASK_KILLED,
                 TaskStatus::SOURCE_SLAVE,
-                UUID::random(),
+                id::UUID::random(),
                 "Killed before delivery to the executor",
                 TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
                 executor->id));
@@ -3224,7 +3312,7 @@ void Slave::killTask(
               taskId,
               TASK_KILLED,
               TaskStatus::SOURCE_SLAVE,
-              UUID::random(),
+              id::UUID::random(),
               "Killed before delivery to the executor",
               TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
               executor->id));
@@ -3512,17 +3600,16 @@ void Slave::checkpointResources(
   //      happens, we expect framework to reconcile based on the
   //      offers they get.
 
-  // An agent with resource providers requires an offer operation feedback
-  // protocol instead of simply checkpointing results by the master. Fail hard
-  // here instead of applying an incompatible message.
-  const bool hasResourceProviders = std::any_of(
-      totalResources.begin(),
-      totalResources.end(),
+  // An agent with resource providers requires an operation feedback protocol
+  // instead of simply checkpointing results by the master. Fail hard here
+  // instead of applying an incompatible message.
+  const bool checkpointingResourceProviderResources = std::any_of(
+      _checkpointedResources.begin(),
+      _checkpointedResources.end(),
       [](const Resource& resource) { return resource.has_provider_id(); });
 
-  CHECK(!hasResourceProviders)
-    << "Master protocol for offer operations is incompatible with agent with "
-       "resource providers";
+  CHECK(!checkpointingResourceProviderResources)
+    << "Resource providers must perform their own checkpointing";
 
   convertResourceFormat(&_checkpointedResources, POST_RESERVATION_REFINEMENT);
 
@@ -3560,27 +3647,10 @@ void Slave::checkpointResources(
   // we avoid a case of inconsistency between the master and the agent if
   // the agent restarts during handling of CheckpointResourcesMessage.
 
-  {
-    // If the checkpointed resources don't have reservation refinements,
-    // checkpoint them on the agent in "pre-reservation-refinement" format
-    // for backward compatibility with old agents. If downgrading is
-    // not possible without losing information, checkpoint the resources in
-    // the "post-reservation-refinement" format. We ignore the return
-    // value of `downgradeResources` because for now, we checkpoint the result
-    // either way.
-    //
-    // TODO(mpark): Do something smarter with the result once something
-    // like agent capability requirements is introduced.
-    RepeatedPtrField<Resource> newCheckpointedResources_ =
-      newCheckpointedResources;
-
-    downgradeResources(&newCheckpointedResources_);
-
-    CHECK_SOME(state::checkpoint(
-        paths::getResourcesTargetPath(metaDir),
-        newCheckpointedResources_))
-      << "Failed to checkpoint resources target " << newCheckpointedResources_;
-  }
+  CHECK_SOME(state::checkpoint(
+      paths::getResourcesTargetPath(metaDir),
+      newCheckpointedResources))
+    << "Failed to checkpoint resources target " << newCheckpointedResources;
 
   Try<Nothing> syncResult = syncCheckpointedResources(
       newCheckpointedResources);
@@ -3708,17 +3778,17 @@ Try<Nothing> Slave::syncCheckpointedResources(
 }
 
 
-void Slave::applyOfferOperation(const ApplyOfferOperationMessage& message)
+void Slave::applyOperation(const ApplyOperationMessage& message)
 {
-  // The offer operation might be from an operator API call,
-  // thus the framework ID here is optional.
+  // The operation might be from an operator API call, thus the framework ID
+  // here is optional.
   Option<FrameworkID> frameworkId = message.has_framework_id()
     ? message.framework_id()
     : Option<FrameworkID>::none();
 
-  Try<UUID> uuid = UUID::fromBytes(message.operation_uuid());
+  Try<id::UUID> uuid = id::UUID::fromBytes(message.operation_uuid().value());
   if (uuid.isError()) {
-    LOG(ERROR) << "Failed to parse offer operation UUID for operation "
+    LOG(ERROR) << "Failed to parse operation UUID for operation "
                << "'" << message.operation_info().id() << "' from "
                << (frameworkId.isSome()
                      ? "framework " + stringify(frameworkId.get())
@@ -3741,30 +3811,22 @@ void Slave::applyOfferOperation(const ApplyOfferOperationMessage& message)
     return;
   }
 
-  OfferOperation* offerOperation = new OfferOperation(
-      protobuf::createOfferOperation(
+  Operation* operation = new Operation(
+      protobuf::createOperation(
           message.operation_info(),
-          protobuf::createOfferOperationStatus(OFFER_OPERATION_PENDING),
+          protobuf::createOperationStatus(OPERATION_PENDING),
           frameworkId,
           info.id(),
           uuid.get()));
 
-  addOfferOperation(offerOperation);
+  addOperation(operation);
 
   if (protobuf::isSpeculativeOperation(message.operation_info())) {
-    Offer::Operation strippedOperation = message.operation_info();
-    protobuf::stripAllocationInfo(&strippedOperation);
-
-    Try<vector<ResourceConversion>> conversions =
-      getResourceConversions(strippedOperation);
-
-    CHECK_SOME(conversions);
-
-    apply(conversions.get());
+    apply(operation);
   }
 
   if (resourceProviderId.isSome()) {
-    resourceProviderManager.applyOfferOperation(message);
+    resourceProviderManager.applyOperation(message);
     return;
   }
 
@@ -3783,21 +3845,66 @@ void Slave::applyOfferOperation(const ApplyOfferOperationMessage& message)
       {_checkpointedResources.begin(), _checkpointedResources.end()},
       false);
 
-  OfferOperationStatusUpdate update =
-    protobuf::createOfferOperationStatusUpdate(
+  UpdateOperationStatusMessage update =
+    protobuf::createUpdateOperationStatusMessage(
         uuid.get(),
-        protobuf::createOfferOperationStatus(OFFER_OPERATION_FINISHED),
+        protobuf::createOperationStatus(OPERATION_FINISHED),
         None(),
         frameworkId,
         info.id());
 
-  updateOfferOperation(offerOperation, update);
+  updateOperation(operation, update);
 
-  removeOfferOperation(offerOperation);
+  removeOperation(operation);
 
   // TODO(nfnt): Use the status update manager to reliably send
   // this message to the master.
   send(master.get(), update);
+}
+
+
+void Slave::reconcileOperations(const ReconcileOperationsMessage& message)
+{
+  bool containsResourceProviderOperations = false;
+
+  foreach (
+      const ReconcileOperationsMessage::Operation& operation,
+      message.operations()) {
+    if (operation.has_resource_provider_id()) {
+      containsResourceProviderOperations = true;
+      continue;
+    }
+
+    Try<id::UUID> operationUuid =
+      id::UUID::fromBytes(operation.operation_uuid().value());
+    CHECK_SOME(operationUuid);
+
+    // The master reconciles when it notices that an operation is missing from
+    // an `UpdateSlaveMessage`. If we cannot find an operation in the agent
+    // state, we send an update to inform the master. If we do find the
+    // operation, then the master and agent state are consistent and we do not
+    // need to do anything.
+    Operation* storedOperation = getOperation(operationUuid.get());
+    if (storedOperation == nullptr) {
+      // For agent default resources, we send best-effort operation status
+      // updates to the master. This is satisfactory because a dropped message
+      // would imply a subsequent agent reregistration, after which an
+      // `UpdateSlaveMessage` would be sent with pending operations.
+      UpdateOperationStatusMessage update =
+        protobuf::createUpdateOperationStatusMessage(
+            operationUuid.get(),
+            protobuf::createOperationStatus(OPERATION_DROPPED),
+            None(),
+            None(),
+            info.id());
+
+      send(master.get(), update);
+    }
+  }
+
+  if (containsResourceProviderOperations) {
+    resourceProviderManager.reconcileOperations(message);
+  }
 }
 
 
@@ -3839,27 +3946,21 @@ void Slave::statusUpdateAcknowledgement(
   }
 
   taskStatusUpdateManager->acknowledgement(
-      taskId, frameworkId, UUID::fromBytes(uuid).get())
+      taskId, frameworkId, id::UUID::fromBytes(uuid).get())
     .onAny(defer(self(),
                  &Slave::_statusUpdateAcknowledgement,
                  lambda::_1,
                  taskId,
                  frameworkId,
-                 UUID::fromBytes(uuid).get()));
+                 id::UUID::fromBytes(uuid).get()));
 }
-
-
-// TODO(greggomann): Implement offer operation update acknowledgement.
-void Slave::offerOperationUpdateAcknowledgement(
-    const UPID& from,
-    const OfferOperationUpdateAcknowledgementMessage& acknowledgement) {}
 
 
 void Slave::_statusUpdateAcknowledgement(
     const Future<bool>& future,
     const TaskID& taskId,
     const FrameworkID& frameworkId,
-    const UUID& uuid)
+    const id::UUID& uuid)
 {
   // The future could fail if this is a duplicate status update acknowledgement.
   if (!future.isReady()) {
@@ -3921,6 +4022,36 @@ void Slave::_statusUpdateAcknowledgement(
   // Remove this framework if it has no pending executors and tasks.
   if (framework->idle()) {
     removeFramework(framework);
+  }
+}
+
+
+void Slave::operationStatusAcknowledgement(
+    const UPID& from,
+    const AcknowledgeOperationStatusMessage& acknowledgement)
+{
+  Try<id::UUID> operationUuid =
+    id::UUID::fromBytes(acknowledgement.operation_uuid().value());
+  CHECK_SOME(operationUuid);
+
+  Operation* operation = getOperation(operationUuid.get());
+  if (operation != nullptr) {
+    resourceProviderManager.acknowledgeOperationStatus(acknowledgement);
+
+    CHECK(operation->statuses_size() > 0);
+    if (protobuf::isTerminalState(
+            operation->statuses(operation->statuses_size() - 1).state())) {
+      // Note that if this acknowledgement is dropped due to resource provider
+      // disconnection, the resource provider will inform the agent about the
+      // operation via an UPDATE_STATE call after it reregisters, which will
+      // cause the agent to add the operation back.
+      removeOperation(operation);
+    }
+  } else {
+    LOG(WARNING) << "Dropping operation update acknowledgement with"
+                 << " status_uuid " << acknowledgement.status_uuid() << " and"
+                 << " operation_uuid " << acknowledgement.operation_uuid()
+                 << " because the operation was not found";
   }
 }
 
@@ -4059,9 +4190,12 @@ void Slave::subscribe(
         }
       }
 
-      containerizer->update(
-          executor->containerId,
-          executor->allocatedResources())
+      publishResources()
+        .then(defer(self(), [=] {
+          return containerizer->update(
+              executor->containerId,
+              executor->allocatedResources());
+        }))
         .onAny(defer(self(),
                      &Self::___run,
                      lambda::_1,
@@ -4108,7 +4242,7 @@ void Slave::subscribe(
               task->task_id(),
               newTaskState,
               TaskStatus::SOURCE_SLAVE,
-              UUID::random(),
+              id::UUID::random(),
               "Task launched during agent restart",
               TaskStatus::REASON_SLAVE_RESTARTED,
               executor->id);
@@ -4263,9 +4397,12 @@ void Slave::registerExecutor(
         }
       }
 
-      containerizer->update(
-          executor->containerId,
-          executor->allocatedResources())
+      publishResources()
+        .then(defer(self(), [=] {
+          return containerizer->update(
+              executor->containerId,
+              executor->allocatedResources());
+        }))
         .onAny(defer(self(),
                      &Self::___run,
                      lambda::_1,
@@ -4450,7 +4587,7 @@ void Slave::reregisterExecutor(
               task->task_id(),
               newTaskState,
               TaskStatus::SOURCE_SLAVE,
-              UUID::random(),
+              id::UUID::random(),
               "Task launched during agent restart",
               TaskStatus::REASON_SLAVE_RESTARTED,
               executorId);
@@ -5279,26 +5416,6 @@ ExecutorInfo Slave::getExecutorInfo(
     executor.mutable_container()->CopyFrom(task.container());
   }
 
-  // TODO(jieyu): We should move those Mesos containerizer specific
-  // logic (e.g., 'hasRootfs') to Mesos containerizer.
-  bool hasRootfs = task.has_container() &&
-                   task.container().type() == ContainerInfo::MESOS &&
-                   task.container().mesos().has_image();
-
-  if (hasRootfs) {
-    ContainerInfo* container = executor.mutable_container();
-
-    // For command tasks, we are now copying the entire
-    // `task.container` into the `executorInfo`. Thus,
-    // `executor.container` now has the image if `task.container`
-    // had one. However, in the case of Mesos container with rootfs,
-    // we want to run the command executor in the host filesystem
-    // and let the command executor pivot_root to the rootfs for its
-    // task. For this reason, we need to strip the image in
-    // `executor.container.mesos`.
-    container->mutable_mesos()->clear_image();
-  }
-
   // Prepare an executor name which includes information on the
   // command being launched.
   string name = "(Task: " + task.task_id().value() + ") ";
@@ -5389,6 +5506,12 @@ ExecutorInfo Slave::getExecutorInfo(
     executor.mutable_command()->add_arguments(
         "--launcher_dir=" + flags.launcher_dir);
 
+    // TODO(jieyu): We should move those Mesos containerizer specific
+    // logic (e.g., 'hasRootfs') to Mesos containerizer.
+    bool hasRootfs = task.has_container() &&
+                     task.container().type() == ContainerInfo::MESOS &&
+                     task.container().mesos().has_image();
+
     if (hasRootfs) {
       executor.mutable_command()->add_arguments(
           "--sandbox_directory=" + flags.sandbox_directory);
@@ -5418,9 +5541,11 @@ ExecutorInfo Slave::getExecutorInfo(
         "'; exit 1");
   }
 
-  // Add an allowance for the command executor. This does lead to a
-  // small overcommit of resources.
+  // Add an allowance for the command (or docker) executor. This does
+  // lead to a small overcommit of resources.
   //
+  // NOTE: The size of the memory is truncated here to preserve the
+  // existing behavior for backward compatibility.
   // TODO(vinod): If a task is using revocable resources, mark the
   // corresponding executor resource (e.g., cpus) to be also
   // revocable. Currently, it is OK because the containerizer is
@@ -5428,7 +5553,8 @@ ExecutorInfo Slave::getExecutorInfo(
   // the container being correctly marked as revocable.
   Resources executorOverhead = Resources::parse(
       "cpus:" + stringify(DEFAULT_EXECUTOR_CPUS) + ";" +
-      "mem:" + stringify(DEFAULT_EXECUTOR_MEM.megabytes())).get();
+      "mem:" + stringify(
+          DEFAULT_EXECUTOR_MEM.bytes() / Bytes::MEGABYTES)).get();
 
   // If the task has an allocation role, we inject it into
   // the executor as well. Note that old masters will not
@@ -5672,11 +5798,11 @@ void Slave::executorTerminated(
         }
       }
 
-      // Only send ExitedExecutorMessage if it is not a Command
-      // Executor because the master doesn't store them; they are
-      // generated by the slave.
+      // Only send ExitedExecutorMessage if it is not a Command (or
+      // Docker) Executor because the master doesn't store them; they
+      // are generated by the slave.
       // TODO(vinod): Reliably forward this message to the master.
-      if (!executor->isCommandExecutor()) {
+      if (!executor->isGeneratedForCommandTask()) {
         ExitedExecutorMessage message;
         message.mutable_slave_id()->MergeFrom(info.id());
         message.mutable_framework_id()->MergeFrom(frameworkId);
@@ -6143,6 +6269,71 @@ void Slave::_checkDiskUsage(const Future<double>& usage)
 }
 
 
+Try<Nothing> Slave::compatible(
+  const SlaveInfo& previous,
+  const SlaveInfo& current) const
+{
+  // TODO(vinod): Also check for version compatibility.
+
+  if (flags.reconfiguration_policy == "equal") {
+    return compatibility::equal(previous, current);
+  }
+
+  if (flags.reconfiguration_policy == "additive") {
+    return compatibility::additive(previous, current);
+  }
+
+  // Should have been validated during startup.
+  UNREACHABLE();
+}
+
+
+// TODO(gilbert): Consider to read the Image GC config dynamically.
+// For now, the Image GC config can only be updated after the agent
+// restarts.
+void Slave::checkImageDiskUsage()
+{
+  // TODO(gilbert): Container image gc is supported for docker image
+  // in Mesos Containerizer for now. Add more image store gc supports
+  // if necessary.
+  Future<double>(::fs::usage(flags.docker_store_dir))
+    .onAny(defer(self(), &Slave::_checkImageDiskUsage, lambda::_1));
+}
+
+
+void Slave::_checkImageDiskUsage(const Future<double>& usage)
+{
+  CHECK(flags.image_gc_config.isSome());
+
+  if (!usage.isReady()) {
+    LOG(ERROR) << "Failed to get image store disk usage: "
+               << (usage.isFailed() ? usage.failure() : "future discarded");
+  } else {
+    LOG(INFO) << "Current docker image store disk usage: "
+              << std::setiosflags(std::ios::fixed) << std::setprecision(2)
+              << 100 * usage.get() << "%.";
+
+    if ((flags.image_gc_config->image_disk_headroom() + usage.get()) > 1.0) {
+      LOG(INFO) << "Image store disk usage exceeds the threshold '"
+                << 100 * (1.0 - flags.image_gc_config->image_disk_headroom())
+                << "%'. Container Image GC is triggered.";
+
+      vector<Image> excludedImages(
+          flags.image_gc_config->excluded_images().begin(),
+          flags.image_gc_config->excluded_images().end());
+
+      containerizer->pruneImages(excludedImages);
+    }
+  }
+
+  delay(
+      Nanoseconds(
+          flags.image_gc_config->image_disk_watch_interval().nanoseconds()),
+      self(),
+      &Slave::checkImageDiskUsage);
+}
+
+
 Future<Nothing> Slave::recover(const Try<state::State>& state)
 {
   if (state.isError()) {
@@ -6303,43 +6494,50 @@ Future<Nothing> Slave::recover(const Try<state::State>& state)
       metrics.recovery_errors += slaveState->errors;
     }
 
+    // Save the previous id into the current `SlaveInfo`, so we can compare
+    // both of them for equality. This is safe because if it turned out that
+    // we can not reuse the id, we will either crash or erase it again.
+    info.mutable_id()->CopyFrom(slaveState->info->id());
+
     // Check for SlaveInfo compatibility.
-    // TODO(vinod): Also check for version compatibility.
+    Try<Nothing> _compatible =
+      compatible(slaveState->info.get(), info);
 
-    SlaveInfo _info(info);
-    _info.mutable_id()->CopyFrom(slaveState->id);
-    if (flags.recover == "reconnect" &&
-        !(_info == slaveState->info.get())) {
-      string message = strings::join(
-          "\n",
-          "Incompatible agent info detected.",
-          "------------------------------------------------------------",
-          "Old agent info:\n" + stringify(slaveState->info.get()),
-          "------------------------------------------------------------",
-          "New agent info:\n" + stringify(info),
-          "------------------------------------------------------------");
+    if (_compatible.isSome()) {
+      // Permitted change, so we reuse the recovered agent id and reconnect
+      // to running executors.
 
-      // Fail the recovery unless the agent is recovering for the first
-      // time after host reboot.
-      //
+      // Prior to Mesos 1.5, the master expected that an agent would never
+      // change its `SlaveInfo` and keep the same slave id, and therefore would
+      // not update it's internal data structures on agent re-registration.
+      if (!(slaveState->info.get() == info)) {
+        requiredMasterCapabilities.agentUpdate = true;
+      }
+
+      // Recover the frameworks.
+      foreachvalue (const FrameworkState& frameworkState,
+                    slaveState->frameworks) {
+        recoverFramework(frameworkState, injectedExecutors, injectedTasks);
+      }
+    } else if (state->rebooted) {
       // Prior to Mesos 1.4 we directly bypass the state recovery and
       // start as a new agent upon reboot (introduced in MESOS-844).
       // This unncessarily discards the existing agent ID (MESOS-6223).
       // Starting in Mesos 1.4 we'll attempt to recover the slave state
-      // even after reboot but in case of slave info mismatch we'll fall
-      // back to recovering as a new agent (existing behavior). This
-      // prevents the agent from flapping if the slave info (resources,
+      // even after reboot but in case of an incompatible slave info change
+      // we'll fall back to recovering as a new agent (existing behavior).
+      // Prior to Mesos 1.5, an incompatible change would be any slave info
+      // mismatch.
+      // This prevents the agent from flapping if the slave info (resources,
       // attributes, etc.) change is due to host maintenance associated
       // with the reboot.
-      if (!state->rebooted) {
-        return Failure(message);
-      }
 
       LOG(WARNING) << "Falling back to recover as a new agent due to error: "
-                   << message;
+                   << _compatible.error();
 
       // Cleaning up the slave state to avoid any state recovery for the
       // old agent.
+      info.clear_id();
       slaveState = None();
 
       // Remove the "latest" symlink if it exists to "checkpoint" the
@@ -6350,13 +6548,7 @@ Future<Nothing> Slave::recover(const Try<state::State>& state)
           << "Failed to remove latest symlink '" << latest << "'";
       }
     } else {
-      info = slaveState->info.get(); // Recover the slave info.
-
-      // Recover the frameworks.
-      foreachvalue (const FrameworkState& frameworkState,
-                    slaveState->frameworks) {
-        recoverFramework(frameworkState, injectedExecutors, injectedTasks);
-      }
+      return Failure(_compatible.error());
     }
   }
 
@@ -6506,10 +6698,23 @@ void Slave::__recover(const Future<Nothing>& future)
     EXIT(EXIT_FAILURE)
       << "Failed to perform recovery: "
       << (future.isFailed() ? future.failure() : "future discarded") << "\n"
-      << "To remedy this do as follows:\n"
-      << "Step 1: rm -f " << paths::getLatestSlavePath(metaDir) << "\n"
-      << "        This ensures agent doesn't recover old live executors.\n"
-      << "Step 2: Restart the agent.";
+      << "If recovery failed due to a change in configuration and you want to\n"
+      << "keep the current agent id, you might want to change the\n"
+      << "`--reconfiguration_policy` flag to a more permissive value.\n"
+      << "\n"
+      << "To restart this agent with a new agent id instead, do as follows:\n"
+      << "rm -f " << paths::getLatestSlavePath(metaDir) << "\n"
+      << "This ensures that the agent does not recover old live executors.\n"
+      << "\n"
+      << "If you use the Docker containerizer and think that the Docker\n"
+      << "daemon state is broken, you can try to clear it. But be careful:\n"
+      << "these commands will erase all containers and images from this host,\n"
+      << "not just those started by Mesos!\n"
+      << "docker kill $(docker ps -q)\n"
+      << "docker rm $(docker ps -a -q)\n"
+      << "docker rmi $(docker images -q)\n"
+      << "\n"
+      << "Finally, restart the agent.";
   }
 
   LOG(INFO) << "Finished recovery";
@@ -6754,19 +6959,16 @@ void Slave::_forwardOversubscribed(const Future<Resources>& oversubscribable)
       // We do not update the agent's resource version since
       // oversubscribed resources cannot be used for any operations
       // but launches. Since oversubscription is run at regular
-      // intervals updating the version could cause a lot of offer
+      // intervals updating the version could cause a lot of
       // operation churn.
       //
-      // TODO(bbannier): Revisit this if  we modify the operations
+      // TODO(bbannier): Revisit this if we modify the operations
       // possible on oversubscribed resources.
 
       UpdateSlaveMessage message;
       message.mutable_slave_id()->CopyFrom(info.id());
-      message.mutable_resource_categories()->set_oversubscribed(true);
+      message.set_update_oversubscribed_resources(true);
       message.mutable_oversubscribed_resources()->CopyFrom(oversubscribed);
-
-      message.mutable_resource_version_uuids()->CopyFrom(
-          protobuf::createResourceVersions(resourceVersions));
 
       CHECK_SOME(master);
       send(master.get(), message);
@@ -6779,6 +6981,67 @@ void Slave::_forwardOversubscribed(const Future<Resources>& oversubscribable)
   delay(flags.oversubscribed_resources_interval,
         self(),
         &Self::forwardOversubscribed);
+}
+
+
+UpdateSlaveMessage Slave::generateResourceProviderUpdate() const
+{
+  // Agent information (total resources, operations, resource
+  // versions) is not passed as part of some `ResourceProvider`, but
+  // globally in `UpdateStateMessage`.
+  //
+  // TODO(bbannier): Pass agent information as a resource provider.
+  UpdateSlaveMessage message;
+  message.mutable_slave_id()->CopyFrom(info.id());
+  message.set_update_oversubscribed_resources(false);
+  message.mutable_resource_version_uuid()->set_value(resourceVersion.toBytes());
+  message.mutable_operations();
+
+  foreachvalue (const Operation* operation, operations) {
+    Result<ResourceProviderID> resourceProviderId =
+      getResourceProviderId(operation->info());
+
+    if (resourceProviderId.isNone()) {
+      message.mutable_operations()
+        ->add_operations()->CopyFrom(*operation);
+    }
+  }
+
+  foreachvalue (ResourceProvider* resourceProvider, resourceProviders) {
+    UpdateSlaveMessage::ResourceProvider* provider =
+      message.mutable_resource_providers()->add_providers();
+
+    provider->mutable_info()->CopyFrom(
+        resourceProvider->info);
+    provider->mutable_total_resources()->CopyFrom(
+        resourceProvider->totalResources);
+    provider->mutable_resource_version_uuid()->set_value(
+        resourceProvider->resourceVersion.toBytes());
+
+    provider->mutable_operations();
+
+    foreachvalue (const Operation* operation,
+                  resourceProvider->operations) {
+      provider->mutable_operations()
+        ->add_operations()->CopyFrom(*operation);
+    }
+  }
+
+  return message;
+}
+
+
+UpdateSlaveMessage Slave::generateUpdateSlaveMessage() const
+{
+  UpdateSlaveMessage message = generateResourceProviderUpdate();
+
+  if (oversubscribedResources.isSome()) {
+    message.set_update_oversubscribed_resources(true);
+    message.mutable_oversubscribed_resources()->CopyFrom(
+        oversubscribedResources.get());
+  }
+
+  return message;
 }
 
 
@@ -6805,69 +7068,63 @@ void Slave::handleResourceProviderMessage(
     case ResourceProviderMessage::Type::UPDATE_STATE: {
       CHECK_SOME(message->updateState);
 
-      const Resources& newTotal = message->updateState->total;
+      const ResourceProviderMessage::UpdateState& updateState =
+        message->updateState.get();
 
-      const ResourceProviderID& resourceProviderId = message->updateState->id;
+      CHECK(updateState.info.has_id());
+      const ResourceProviderID& resourceProviderId = updateState.info.id();
 
-      const Resources oldTotal =
-        totalResources.filter([&resourceProviderId](const Resource& resource) {
-          return resource.provider_id() == resourceProviderId;
-        });
+      ResourceProvider* resourceProvider =
+        getResourceProvider(resourceProviderId);
 
-      bool updated = false;
+      if (resourceProvider == nullptr) {
+        resourceProvider = new ResourceProvider(
+            updateState.info,
+            updateState.totalResources,
+            updateState.resourceVersion);
 
-      if (oldTotal != newTotal) {
-        totalResources -= oldTotal;
-        totalResources += newTotal;
+        addResourceProvider(resourceProvider);
 
-        updated = true;
-      }
-
-      // Update offer operation state.
-      //
-      // We only update offer operations which are not contained in both the
-      // known and just received sets. All other offer operations will be
-      // updated via relayed offer operation status updates.
-      auto isForResourceProvider = [resourceProviderId](
-                                      const OfferOperation& operation) {
-        Result<ResourceProviderID> id = getResourceProviderId(operation.info());
-        return id.isSome() && resourceProviderId == id.get();
-      };
-
-      hashmap<UUID, OfferOperation*> knownOfferOperations;
-      foreachpair(auto&& uuid, auto&& operation, offerOperations) {
-        if (isForResourceProvider(*operation)) {
-          knownOfferOperations.put(uuid, operation);
+        foreachvalue (const Operation& operation,
+                      updateState.operations) {
+          addOperation(new Operation(operation));
         }
-      }
 
-      hashmap<UUID, OfferOperation> receivedOfferOperations;
-      foreach (
-          const OfferOperation& operation,
-          message->updateState->operations) {
-        CHECK(isForResourceProvider(operation))
-          << "Received operation on unexpected resource provider "
-          << "from resource provider " << resourceProviderId;
+        // Update the 'total' in the Slave.
+        totalResources += updateState.totalResources;
+      } else {
+        // Always update the resource provider info.
+        resourceProvider->info = updateState.info;
 
-        Try<UUID> operationUuid = UUID::fromBytes(operation.operation_uuid());
-        CHECK_SOME(operationUuid);
+        if (resourceProvider->totalResources != updateState.totalResources) {
+          // Update the 'total' in the Slave.
+          CHECK(totalResources.contains(resourceProvider->totalResources));
+          totalResources -= resourceProvider->totalResources;
+          totalResources += updateState.totalResources;
 
-        receivedOfferOperations.put(operationUuid.get(), operation);
-      }
+          // Update the 'total' in the resource provider.
+          resourceProvider->totalResources = updateState.totalResources;
+        }
 
-      const hashset<UUID> knownUuids = knownOfferOperations.keys();
-      const hashset<UUID> receivedUuids = receivedOfferOperations.keys();
-
-      if (knownUuids != receivedUuids) {
-        // Handle offer operations known to the agent but not reported by the
-        // resource provider. These could be operations where the agent has
-        // started tracking an offer operation, but the resource provider failed
-        // over before it could bookkeep the operation.
+        // Update operation state.
         //
-        // NOTE: We do not mutate offer operations statuses here; this
-        // would be the responsibility of a offer operation status
-        // update handler.
-        hashset<UUID> disappearedOperations;
+        // We only update operations which are not contained in both
+        // the known and just received sets. All other operations will
+        // be updated via relayed operation status updates.
+        const hashset<id::UUID> knownUuids =
+          resourceProvider->operations.keys();
+
+        const hashset<id::UUID> receivedUuids = updateState.operations.keys();
+
+        // Handle operations known to the agent but not reported by
+        // the resource provider. These could be operations where the
+        // agent has started tracking an operation, but the resource
+        // provider failed over before it could bookkeep the
+        // operation.
+        //
+        // NOTE: We do not mutate operations statuses here; this would
+        // be the responsibility of a operation status update handler.
+        hashset<id::UUID> disappearedOperations;
         std::set_difference(
             knownUuids.begin(),
             knownUuids.end(),
@@ -6876,20 +7133,20 @@ void Slave::handleResourceProviderMessage(
             std::inserter(
                 disappearedOperations, disappearedOperations.begin()));
 
-        foreach (const UUID& uuid, disappearedOperations) {
-          // TODO(bbannier): Instead of simply dropping an operation with
-          // `removeOfferOperation` here we should instead send a `Reconcile`
-          // message with a failed state to the resource provider so its status
-          // update manager can reliably deliver the operation status to the
-          // framework.
-          CHECK(offerOperations.contains(uuid));
-          removeOfferOperation(offerOperations.at(uuid));
+        foreach (const id::UUID& uuid, disappearedOperations) {
+          // TODO(bbannier): Instead of simply dropping an operation
+          // with `removeOperation` here we should instead send a
+          // `Reconcile` message with a failed state to the resource
+          // provider so its status update manager can reliably
+          // deliver the operation status to the framework.
+          CHECK(resourceProvider->operations.contains(uuid));
+          removeOperation(resourceProvider->operations.at(uuid));
         }
 
-        // Handle offer operations known to the resource provider but
-        // not the agent. This can happen if the agent failed over and
-        // the resource provider reregistered.
-        hashset<UUID> reappearedOperations;
+        // Handle operations known to the resource provider but not
+        // the agent. This can happen if the agent failed over and the
+        // resource provider reregistered.
+        hashset<id::UUID> reappearedOperations;
         std::set_difference(
             receivedUuids.begin(),
             receivedUuids.end(),
@@ -6897,32 +7154,17 @@ void Slave::handleResourceProviderMessage(
             knownUuids.end(),
             std::inserter(reappearedOperations, reappearedOperations.begin()));
 
-        foreach (const UUID& uuid, reappearedOperations) {
-          // Start tracking this offer operation.
+        foreach (const id::UUID& uuid, reappearedOperations) {
+          // Start tracking this operation.
           //
           // NOTE: We do not need to update total resources here as its
           // state was sync explicitly with the received total above.
-          CHECK(receivedOfferOperations.contains(uuid));
-          addOfferOperation(
-              new OfferOperation(receivedOfferOperations.at(uuid)));
+          CHECK(updateState.operations.contains(uuid));
+          addOperation(new Operation(updateState.operations.at(uuid)));
         }
 
-        updated = true;
-      }
-
-      // Update resource version of this resource provider.
-      const UUID& resourceVersionUuid =
-        message->updateState->resourceVersionUuid;
-
-      if (!resourceVersions.contains(resourceProviderId) ||
-          resourceVersions.at(resourceProviderId) != resourceVersionUuid) {
-        if (resourceVersions.contains(resourceProviderId)) {
-          resourceVersions.at(resourceProviderId) = resourceVersionUuid;
-        } else {
-          resourceVersions.insert({resourceProviderId, resourceVersionUuid});
-        }
-
-        updated = true;
+        // Update resource version of this resource provider.
+        resourceProvider->resourceVersion = updateState.resourceVersion;
       }
 
       // Send the updated resources to the master if the agent is running. Note
@@ -6937,61 +7179,61 @@ void Slave::handleResourceProviderMessage(
           break;
         }
         case RUNNING: {
-          if (updated) {
-            LOG(INFO) << "Forwarding new total resources " << totalResources;
+          LOG(INFO) << "Forwarding new total resources " << totalResources;
 
-            // Inform the master that the total capacity of this agent has
-            // changed.
-            UpdateSlaveMessage updateSlaveMessage;
-            updateSlaveMessage.mutable_slave_id()->CopyFrom(info.id());
-            updateSlaveMessage.mutable_resource_categories()->set_total(true);
+          // Inform the master about the update from the resource provider.
+          send(master.get(), generateResourceProviderUpdate());
 
-            updateSlaveMessage.mutable_total_resources()->CopyFrom(
-                totalResources);
-
-            updateSlaveMessage.mutable_resource_version_uuids()->CopyFrom(
-                protobuf::createResourceVersions(resourceVersions));
-
-            UpdateSlaveMessage::OfferOperations* operations =
-              updateSlaveMessage.mutable_offer_operations();
-
-            foreachvalue (const OfferOperation* operation, offerOperations) {
-              operations->add_operations()->CopyFrom(*operation);
-            }
-
-            send(master.get(), updateSlaveMessage);
-
-            break;
-          }
+          break;
         }
       }
       break;
     }
-    case ResourceProviderMessage::Type::UPDATE_OFFER_OPERATION_STATUS: {
-      CHECK_SOME(message->updateOfferOperationStatus);
+    case ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS: {
+      CHECK_SOME(message->updateOperationStatus);
 
-      const OfferOperationStatusUpdate& update =
-        message->updateOfferOperationStatus->update;
+      const UpdateOperationStatusMessage& update =
+        message->updateOperationStatus->update;
 
-      Try<UUID> operationUUID = UUID::fromBytes(update.operation_uuid());
+      Try<id::UUID> operationUUID =
+        id::UUID::fromBytes(update.operation_uuid().value());
       CHECK_SOME(operationUUID);
 
-      OfferOperation* operation = getOfferOperation(operationUUID.get());
-      if (operation == nullptr) {
-        LOG(WARNING) << "Failed to find the offer operation '"
-                     << update.status().operation_id() << "' (uuid: "
-                     << operationUUID->toString() << ") for framework "
-                     << update.framework_id();
-        return;
-      }
+      Operation* operation = getOperation(operationUUID.get());
 
-      updateOfferOperation(operation, update);
+      if (operation != nullptr) {
+        // The agent might not know about the operation in the
+        // following cases:
+        //
+        // Case 1:
+        // (1) The agent sends to a resource provder an ACK for a
+        //     terminal operation status update and removes the
+        //     operation.
+        // (2) The resource provider doesn't get the ACK.
+        // (3) The resource provider's status update manager resends
+        //     the operation status update.
+        //
+        // Case 2:
+        // (1) The master knows an operation that the agent doesn't
+        //     know, because an ApplyOperationMessage was dropped.
+        // (2) The master sends a ReconcileOperationsMessage
+        //     message to the agent, who forwards it to a resource
+        //     provider.
+        // (3) The resource provider doesn't know the operation, so it
+        //     sends an operation status update with the state
+        //     OPERATION_DROPPED.
+        //
+        // In both cases the agent should not update it's internal
+        // state, but it should still forward the operation status
+        // update.
+        updateOperation(operation, update);
+      }
 
       switch (state) {
         case RECOVERING:
         case DISCONNECTED:
         case TERMINATING: {
-          LOG(WARNING) << "Dropping status update of offer operation '"
+          LOG(WARNING) << "Dropping status update of operation '"
                        << update.status().operation_id() << "' (uuid: "
                        << operationUUID->toString() << ") for framework "
                        << update.framework_id() << " because agent is in "
@@ -6999,15 +7241,16 @@ void Slave::handleResourceProviderMessage(
           break;
         }
         case RUNNING: {
-          LOG(INFO) << "Forwarding status update of offer operation '"
-                    << update.status().operation_id()
+          LOG(INFO) << "Forwarding status update of "
+                    << (operation == nullptr ? "unknown " : "")
+                    << "operation '" << update.status().operation_id()
                     << "' (uuid: " << operationUUID->toString()
                     << ") for framework " << update.framework_id();
 
           // The status update from the resource provider didn't
-          // provide the agent ID (because the resource provider doesn't
-          // know it), hence we inject it here.
-          OfferOperationStatusUpdate _update;
+          // provide the agent ID (because the resource provider
+          // doesn't know it), hence we inject it here.
+          UpdateOperationStatusMessage _update;
           _update.CopyFrom(update);
           _update.mutable_slave_id()->CopyFrom(info.id());
 
@@ -7015,10 +7258,56 @@ void Slave::handleResourceProviderMessage(
           break;
         }
       }
+      break;
+    }
+    case ResourceProviderMessage::Type::DISCONNECT: {
+      CHECK_SOME(message->disconnect);
 
-      if (protobuf::isTerminalState(operation->latest_status().state())) {
-        removeOfferOperation(operation);
+      const ResourceProviderID& resourceProviderId =
+        message->disconnect->resourceProviderId;
+
+      ResourceProvider* resourceProvider =
+        getResourceProvider(resourceProviderId);
+
+      if (resourceProvider == nullptr) {
+        LOG(ERROR) << "Failed to find the disconnected resource provider "
+                   << resourceProviderId << ", ignoring the message";
+        break;
       }
+
+      // A disconnected resource provider effectively results in its
+      // total resources to be set to empty. This will cause offers to
+      // be rescinded so that no operation or task can be launched
+      // using resources from the disconnected resource provider. If
+      // later, the resource provider reconnects, it'll result in
+      // an `UpdateSlaveMessage` so that its resources can be offered
+      // again by the master.
+      CHECK(totalResources.contains(resourceProvider->totalResources));
+      totalResources -= resourceProvider->totalResources;
+
+      resourceProvider->totalResources = Resources();
+
+      // Send the updated resources to the master if the agent is running. Note
+      // that since we have already updated our copy of the latest resource
+      // provider resources, it is safe to consume this message and wait for the
+      // next one; even if we do not send the update to the master right now, an
+      // update will be send once the agent reregisters.
+      switch (state) {
+        case RECOVERING:
+        case DISCONNECTED:
+        case TERMINATING: {
+          break;
+        }
+        case RUNNING: {
+          LOG(INFO) << "Forwarding new total resources " << totalResources;
+
+          // Inform the master about the update from the resource provider.
+          send(master.get(), generateResourceProviderUpdate());
+
+          break;
+        }
+      }
+      break;
     }
   }
 
@@ -7028,29 +7317,45 @@ void Slave::handleResourceProviderMessage(
 }
 
 
-void Slave::addOfferOperation(OfferOperation* operation)
+void Slave::addOperation(Operation* operation)
 {
-  Try<UUID> uuid = UUID::fromBytes(operation->operation_uuid());
+  Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
   CHECK_SOME(uuid);
 
-  offerOperations.put(uuid.get(), operation);
+  operations.put(uuid.get(), operation);
+
+  Result<ResourceProviderID> resourceProviderId =
+    getResourceProviderId(operation->info());
+
+  CHECK(!resourceProviderId.isError())
+    << "Failed to get resource provider ID: "
+    << resourceProviderId.error();
+
+  if (resourceProviderId.isSome()) {
+    ResourceProvider* resourceProvider =
+      getResourceProvider(resourceProviderId.get());
+
+    CHECK_NOTNULL(resourceProvider);
+
+    resourceProvider->addOperation(operation);
+  }
 }
 
 
-void Slave::updateOfferOperation(
-    OfferOperation* operation,
-    const OfferOperationStatusUpdate& update)
+void Slave::updateOperation(
+    Operation* operation,
+    const UpdateOperationStatusMessage& update)
 {
   CHECK_NOTNULL(operation);
 
-  const OfferOperationStatus& status = update.status();
+  const OperationStatus& status = update.status();
 
-  Option<OfferOperationStatus> latestStatus;
+  Option<OperationStatus> latestStatus;
   if (update.has_latest_status()) {
     latestStatus = update.latest_status();
   }
 
-  // Whether the offer operation has just become terminated.
+  // Whether the operation has just become terminated.
   Option<bool> terminated;
 
   if (latestStatus.isSome()) {
@@ -7073,14 +7378,27 @@ void Slave::updateOfferOperation(
     }
   }
 
-  operation->add_statuses()->CopyFrom(status);
+  // Adding the update's status to the stored operation below is the one place
+  // in this function where we mutate the operation state irrespective of the
+  // value of `terminated`. We check to see if this status update is a retry;
+  // if so, we do nothing.
+  bool isRetry = false;
+  if (status.has_uuid()) {
+    foreach (const OperationStatus& storedStatus, operation->statuses()) {
+      if (storedStatus.has_uuid() && storedStatus.uuid() == status.uuid()) {
+        isRetry = true;
+        break;
+      }
+    }
+  }
 
-  Try<UUID> operationUUID = UUID::fromBytes(operation->operation_uuid());
-  CHECK_SOME(operationUUID);
+  if (!isRetry) {
+    operation->add_statuses()->CopyFrom(status);
+  }
 
-  LOG(INFO) << "Updating the state of offer operation '"
+  LOG(INFO) << "Updating the state of operation '"
             << operation->info().id()
-            << "' (uuid: " << operationUUID.get()
+            << "' (uuid: " << operation->uuid()
             << ") of framework " << operation->framework_id()
             << " (latest state: " << operation->latest_status().state()
             << ", status update state: " << status.state() << ")";
@@ -7095,71 +7413,177 @@ void Slave::updateOfferOperation(
     return;
   }
 
-  Try<Resources> consumed = protobuf::getConsumedResources(operation->info());
-  CHECK_SOME(consumed);
-
   switch (update.latest_status().state()) {
     // Terminal state, and the conversion is successful.
-    case OFFER_OPERATION_FINISHED: {
-      // 'totalResources' don't have allocations set, we need
-      // to remove them from the consumed and converted resources.
-      consumed->unallocate();
-
-      Resources converted =
-        update.latest_status().converted_resources();
-      converted.unallocate();
-
-      ResourceConversion conversion(consumed.get(), converted);
-
-      apply({conversion});
-
+    case OPERATION_FINISHED: {
+      apply(operation);
       break;
     }
 
     // Terminal state, and the conversion has failed.
-    case OFFER_OPERATION_FAILED:
-    case OFFER_OPERATION_ERROR: {
+    case OPERATION_FAILED:
+    case OPERATION_ERROR:
+    case OPERATION_DROPPED: {
       break;
     }
 
     // Non-terminal. This shouldn't happen.
-    case OFFER_OPERATION_PENDING:
-    case OFFER_OPERATION_UNSUPPORTED: {
-      LOG(FATAL) << "Unexpected offer operation state "
+    case OPERATION_PENDING:
+    case OPERATION_UNSUPPORTED: {
+      LOG(FATAL) << "Unexpected operation state "
                  << operation->latest_status().state();
     }
   }
 }
 
 
-void Slave::removeOfferOperation(OfferOperation* operation)
+void Slave::removeOperation(Operation* operation)
 {
-  Try<UUID> uuid = UUID::fromBytes(operation->operation_uuid());
+  Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
   CHECK_SOME(uuid);
 
-  CHECK(offerOperations.contains(uuid.get()))
-    << "Unknown offer operation (uuid: " << uuid->toString() << ")";
+  Result<ResourceProviderID> resourceProviderId =
+    getResourceProviderId(operation->info());
 
-  offerOperations.erase(uuid.get());
+  CHECK(!resourceProviderId.isError())
+    << "Failed to get resource provider ID: "
+    << resourceProviderId.error();
+
+  if (resourceProviderId.isSome()) {
+    ResourceProvider* resourceProvider =
+      getResourceProvider(resourceProviderId.get());
+
+    CHECK_NOTNULL(resourceProvider);
+
+    resourceProvider->removeOperation(operation);
+  }
+
+  CHECK(operations.contains(uuid.get()))
+    << "Unknown operation (uuid: " << uuid->toString() << ")";
+
+  operations.erase(uuid.get());
   delete operation;
 }
 
 
-OfferOperation* Slave::getOfferOperation(const UUID& uuid) const
+Operation* Slave::getOperation(const id::UUID& uuid) const
 {
-  if (offerOperations.contains(uuid)) {
-    return offerOperations.at(uuid);
+  if (operations.contains(uuid)) {
+    return operations.at(uuid);
   }
   return nullptr;
 }
 
 
-void Slave::apply(const vector<ResourceConversion>& conversions)
+void Slave::addResourceProvider(ResourceProvider* resourceProvider)
 {
+  CHECK(resourceProvider->info.has_id());
+  CHECK(!resourceProviders.contains(resourceProvider->info.id()));
+
+  resourceProviders.put(
+      resourceProvider->info.id(),
+      resourceProvider);
+}
+
+
+ResourceProvider* Slave::getResourceProvider(const ResourceProviderID& id) const
+{
+  if (resourceProviders.contains(id)) {
+    return resourceProviders.at(id);
+  }
+  return nullptr;
+}
+
+
+void Slave::apply(Operation* operation)
+{
+  vector<ResourceConversion> conversions;
+
+  // NOTE: 'totalResources' don't have allocations set, we need to
+  // remove them from the conversions.
+
+  if (protobuf::isSpeculativeOperation(operation->info())) {
+    Offer::Operation strippedOperation = operation->info();
+    protobuf::stripAllocationInfo(&strippedOperation);
+
+    Try<vector<ResourceConversion>> _conversions =
+      getResourceConversions(strippedOperation);
+
+    CHECK_SOME(_conversions);
+
+    conversions = _conversions.get();
+  } else {
+    // For non-speculative operations, we only apply the conversion
+    // once it becomes terminal. Before that, we don't know the
+    // converted resources of the conversion.
+    CHECK_EQ(OPERATION_FINISHED, operation->latest_status().state());
+
+    Try<Resources> consumed = protobuf::getConsumedResources(operation->info());
+    CHECK_SOME(consumed);
+
+    Resources converted = operation->latest_status().converted_resources();
+
+    consumed->unallocate();
+    converted.unallocate();
+
+    conversions.emplace_back(consumed.get(), converted);
+  }
+
+  // Now, actually apply the operation.
   Try<Resources> resources = totalResources.apply(conversions);
   CHECK_SOME(resources);
 
   totalResources = resources.get();
+
+  Result<ResourceProviderID> resourceProviderId =
+    getResourceProviderId(operation->info());
+
+  CHECK(!resourceProviderId.isError())
+    << "Failed to get resource provider ID: "
+    << resourceProviderId.error();
+
+  // Besides updating the agent's `totalResources`, we also need to
+  // update the resource provider's `totalResources`.
+  if (resourceProviderId.isSome()) {
+    ResourceProvider* resourceProvider =
+      getResourceProvider(resourceProviderId.get());
+
+    CHECK_NOTNULL(resourceProvider);
+
+    Try<Resources> resources =
+      resourceProvider->totalResources.apply(conversions);
+
+    CHECK_SOME(resources);
+
+    resourceProvider->totalResources = resources.get();
+  }
+}
+
+
+Future<Nothing> Slave::publishResources(
+    const Option<Resources>& additionalResources)
+{
+  Resources resources;
+
+  // NOTE: For resources providers that serve quantity-based resources
+  // without any identifiers (such as memory), it is very hard to keep
+  // track of published resources. So instead of implementing diff-based
+  // resource publishing, we implement an "ensure-all" semantics, and
+  // always calculate the total resources that need to remain published.
+  foreachvalue (const Framework* framework, frameworks) {
+    // NOTE: We do not call `framework->allocatedResource()` here
+    // because we do not want to publsh resources for pending tasks that
+    // have not been authorized yet.
+    foreachvalue (const Executor* executor, framework->executors) {
+      resources += executor->allocatedResources();
+    }
+  }
+
+  if (additionalResources.isSome()) {
+    resources += additionalResources.get();
+  }
+
+  return resourceProviderManager.publishResources(resources);
 }
 
 
@@ -7553,7 +7977,7 @@ void Slave::sendExecutorTerminatedStatusUpdate(
           taskId,
           state,
           TaskStatus::SOURCE_SLAVE,
-          UUID::random(),
+          id::UUID::random(),
           message,
           reason,
           executor->id,
@@ -7836,7 +8260,7 @@ Executor* Framework::addExecutor(const ExecutorInfo& executorInfo)
   // ContainerID to create the executor's directory and generate the secret.
   // Consider fixing this since 'launchExecutor()' is handled asynchronously.
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Option<string> user = None();
 #ifndef __WINDOWS__
@@ -8386,11 +8810,16 @@ Executor::Executor(
 {
   CHECK_NOTNULL(slave);
 
+  // TODO(jieyu): The way we determine if an executor is generated for
+  // a command task (either command or docker executor) is really
+  // hacky. We rely on the fact that docker executor launch command is
+  // set in the docker containerizer so that this check is still valid
+  // in the slave.
   Result<string> executorPath =
     os::realpath(path::join(slave->flags.launcher_dir, MESOS_EXECUTOR));
 
   if (executorPath.isSome()) {
-    commandExecutor =
+    isGeneratedForCommandTask_ =
       strings::contains(info.command().value(), executorPath.get());
   }
 }
@@ -8510,21 +8939,7 @@ void Executor::checkpointExecutor()
 
   VLOG(1) << "Checkpointing ExecutorInfo to '" << path << "'";
 
-  {
-    // If the checkpointed resources don't have reservation refinements,
-    // checkpoint them on the agent in "pre-reservation-refinement" format
-    // for backward compatibility with old agents. If downgrading is
-    // not possible without losing information, checkpoint the resources in
-    // the "post-reservation-refinement" format. We ignore the return
-    // value of `downgradeResources` because for now, we checkpoint the result
-    // either way.
-    //
-    // TODO(mpark): Do something smarter with the result once something
-    // like agent capability requirements is introduced.
-    ExecutorInfo info_ = info;
-    downgradeResources(info_.mutable_resources());
-    CHECK_SOME(state::checkpoint(path, info_));
-  }
+  CHECK_SOME(state::checkpoint(path, info));
 
   // Create the meta executor directory.
   // NOTE: This creates the 'latest' symlink in the meta directory.
@@ -8553,21 +8968,7 @@ void Executor::checkpointTask(const Task& task)
 
   VLOG(1) << "Checkpointing TaskInfo to '" << path << "'";
 
-  {
-    // If the checkpointed resources don't have reservation refinements,
-    // checkpoint them on the agent in "pre-reservation-refinement" format
-    // for backward compatibility with old agents. If downgrading is
-    // not possible without losing information, checkpoint the resources in
-    // the "post-reservation-refinement" format. We ignore the return
-    // value of `downgradeResources` because for now, we checkpoint the result
-    // either way.
-    //
-    // TODO(mpark): Do something smarter with the result once something
-    // like agent capability requirements is introduced.
-    Task task_ = task;
-    downgradeResources(task_.mutable_resources());
-    CHECK_SOME(state::checkpoint(path, task_));
-  }
+  CHECK_SOME(state::checkpoint(path, task));
 }
 
 
@@ -8616,7 +9017,7 @@ void Executor::recoverTask(const TaskState& state, bool recheckpointTask)
       CHECK(update.has_uuid())
         << "Expecting updates without 'uuid' to have been rejected";
 
-      if (state.acks.contains(UUID::fromBytes(update.uuid()).get())) {
+      if (state.acks.contains(id::UUID::fromBytes(update.uuid()).get())) {
         completeTask(state.id);
       }
       break;
@@ -8697,9 +9098,9 @@ bool Executor::incompleteTasks()
 }
 
 
-bool Executor::isCommandExecutor() const
+bool Executor::isGeneratedForCommandTask() const
 {
-  return commandExecutor;
+  return isGeneratedForCommandTask_;
 }
 
 
@@ -8742,6 +9143,30 @@ Resources Executor::allocatedResources() const
   }
 
   return allocatedResources;
+}
+
+
+void ResourceProvider::addOperation(Operation* operation)
+{
+  Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
+  CHECK_SOME(uuid);
+
+  CHECK(!operations.contains(uuid.get()))
+    << "Operation (uuid: " << uuid->toString() << ") already exists";
+
+  operations.put(uuid.get(), operation);
+}
+
+
+void ResourceProvider::removeOperation(Operation* operation)
+{
+  Try<id::UUID> uuid = id::UUID::fromBytes(operation->uuid().value());
+  CHECK_SOME(uuid);
+
+  CHECK(operations.contains(uuid.get()))
+    << "Unknown operation (uuid: " << uuid->toString() << ")";
+
+  operations.erase(uuid.get());
 }
 
 

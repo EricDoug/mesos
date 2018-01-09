@@ -18,8 +18,10 @@
 
 #include <unistd.h>
 
+#include <sys/socket.h>
 #include <sys/wait.h>
 
+#include <cstring>
 #include <vector>
 
 #include <process/collect.hpp>
@@ -317,16 +319,15 @@ Try<pid_t> clone(
   iov.iov_base = base;
   iov.iov_len = sizeof(base);
 
-  // Need to allocate a char array large enough to hold "control"
-  // data. However, since this buffer is in reality a 'struct cmsghdr'
-  // we use a union to ensure that it is aligned as required for that
-  // structure.
+  // We need to allocate a char array large enough to hold "control" data.
+  // However, since this buffer is in reality a 'cmsghdr' with the payload, we
+  // use a union to ensure that it is aligned as required for that structure.
   union {
-    struct cmsghdr cmessage;
-    char control[CMSG_SPACE(sizeof(struct ucred))];
+    cmsghdr cmessage;
+    char control[CMSG_SPACE(sizeof(ucred))];
   };
 
-  cmessage.cmsg_len = CMSG_LEN(sizeof(struct ucred));
+  cmessage.cmsg_len = CMSG_LEN(sizeof(ucred));
   cmessage.cmsg_level = SOL_SOCKET;
   cmessage.cmsg_type = SCM_CREDENTIALS;
 
@@ -336,7 +337,7 @@ Try<pid_t> clone(
   message.msg_iov = &iov;
   message.msg_iovlen = 1;
   message.msg_control = control;
-  message.msg_controllen = sizeof(control); // CMSG_LEN(sizeof(struct ucred));
+  message.msg_controllen = sizeof(control); // CMSG_LEN(sizeof(ucred));
 
   // Finally, the stack we'll use in the call to os::clone below (we
   // allocate the stack here in order to keep the call to os::clone
@@ -388,14 +389,17 @@ Try<pid_t> clone(
 
     // Extract pid.
     if (CMSG_FIRSTHDR(&message) == nullptr ||
-        CMSG_FIRSTHDR(&message)->cmsg_len != CMSG_LEN(sizeof(struct ucred)) ||
+        CMSG_FIRSTHDR(&message)->cmsg_len != CMSG_LEN(sizeof(ucred)) ||
         CMSG_FIRSTHDR(&message)->cmsg_level != SOL_SOCKET ||
         CMSG_FIRSTHDR(&message)->cmsg_type != SCM_CREDENTIALS) {
       kill(child, SIGKILL);
       return Error("Bad control data received");
     }
 
-    pid_t pid = ((struct ucred*) CMSG_DATA(CMSG_FIRSTHDR(&message)))->pid;
+    ucred cred;
+    std::memcpy(&cred, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(ucred));
+
+    const pid_t pid = cred.pid;
 
     // Need to `waitpid` on child process to avoid a zombie. Note that
     // it's expected that the child will terminate quickly hence
@@ -453,17 +457,18 @@ Try<pid_t> clone(
           stack.get(),
           flags,
           [=]() {
-            struct ucred* cred = reinterpret_cast<struct ucred*>(
-                CMSG_DATA(CMSG_FIRSTHDR(&message)));
+            ucred cred;
+            cred.pid = ::getpid();
+            cred.uid = ::getuid();
+            cred.gid = ::getgid();
 
             // Now send back the pid and have it be translated appropriately
             // by the kernel to the enclosing pid namespace.
             //
             // NOTE: sending back the pid is best effort because we're going
             // to exit no matter what.
-            cred->pid = ::getpid();
-            cred->uid = ::getuid();
-            cred->gid = ::getgid();
+            std::memcpy(
+                CMSG_DATA(CMSG_FIRSTHDR(&message)), &cred, sizeof(ucred));
 
             if (sendmsg(sockets[1], &message, 0) == -1) {
               // Failed to send the pid back to the parent!

@@ -399,26 +399,18 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, ReregisterSlavePartitionAware)
   Future<SlaveReregisteredMessage> slaveReregistered = FUTURE_PROTOBUF(
       SlaveReregisteredMessage(), master.get()->pid, slave.get()->pid);
 
+  Future<TaskStatus> runningAgainStatus;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&runningAgainStatus));
+
   detector.appoint(master.get()->pid);
 
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregistered);
 
-  // Perform explicit reconciliation; the task should still be running.
-  TaskStatus status;
-  status.mutable_task_id()->CopyFrom(task.task_id());
-  status.mutable_slave_id()->CopyFrom(slaveId);
-  status.set_state(TASK_STAGING); // Dummy value.
-
-  Future<TaskStatus> reconcileUpdate;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&reconcileUpdate));
-
-  driver.reconcileTasks({status});
-
-  AWAIT_READY(reconcileUpdate);
-  EXPECT_EQ(TASK_RUNNING, reconcileUpdate->state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate->reason());
+  AWAIT_READY(runningAgainStatus);
+  EXPECT_EQ(TASK_RUNNING, runningAgainStatus->state());
+  EXPECT_EQ(task.task_id(), runningAgainStatus->task_id());
 
   Clock::resume();
 
@@ -713,28 +705,18 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, ReregisterSlaveNotPartitionAware)
   Future<SlaveReregisteredMessage> slaveReregistered = FUTURE_PROTOBUF(
       SlaveReregisteredMessage(), master.get()->pid, slave.get()->pid);
 
+  Future<TaskStatus> runningAgainStatus;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&runningAgainStatus));
+
   detector.appoint(master.get()->pid);
 
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregistered);
 
-  // Perform explicit reconciliation. The task should be running
-  // for the non-PARTITION_AWARE framework.
-  TaskStatus status;
-  status.mutable_task_id()->CopyFrom(task.task_id());
-  status.mutable_slave_id()->CopyFrom(slaveId);
-  status.set_state(TASK_STAGING); // Dummy value.
-
-  Future<TaskStatus> reconcileUpdate;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&reconcileUpdate));
-
-  driver.reconcileTasks({status});
-
-  AWAIT_READY(reconcileUpdate);
-  EXPECT_EQ(TASK_RUNNING, reconcileUpdate->state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate->reason());
-  EXPECT_FALSE(reconcileUpdate->has_unreachable_time());
+  AWAIT_READY(runningAgainStatus);
+  EXPECT_EQ(TASK_RUNNING, runningAgainStatus->state());
+  EXPECT_EQ(task.task_id(), runningAgainStatus->task_id());
 
   Clock::resume();
 
@@ -826,13 +808,16 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, ReregisterSlaveNotPartitionAware)
 // not. Both tasks should survive the reregistration of the partitioned
 // agent: we allow the non-partition-aware task to continue running for
 // backward compatibility with the "non-strict" Mesos 1.0 behavior.
+//
+// TODO(alexr): Re-enable once MESOS-8334 is resolved.
 TEST_F_TEMP_DISABLED_ON_WINDOWS(
     PartitionTest,
-    PartitionedSlaveReregistrationMasterFailover)
+    DISABLED_PartitionedSlaveReregistrationMasterFailover)
 {
   Clock::pause();
 
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry = "replicated_log";
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -1027,6 +1012,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   EXPECT_CALL(sched2, registered(&driver2, _, _))
     .WillOnce(FutureSatisfy(&registered2));
 
+  Future<TaskStatus> runningAgainStatus1;
+  EXPECT_CALL(sched1, statusUpdate(&driver1, _))
+    .WillOnce(FutureArg<1>(&runningAgainStatus1));
+
+  Future<TaskStatus> runningAgainStatus2;
+  EXPECT_CALL(sched2, statusUpdate(&driver2, _))
+    .WillOnce(FutureArg<1>(&runningAgainStatus2));
+
   // Simulate a new master detected event to the slave and the schedulers.
   detector.appoint(master.get()->pid);
 
@@ -1038,39 +1031,11 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   AWAIT_READY(registered1);
   AWAIT_READY(registered2);
 
-  // Have each scheduler perform explicit reconciliation. Both `task1` and
-  // `task2` should be running: `task2` because it is PARTITION_AWARE,
-  // `task1` because the master has failed over and we emulate the old
-  // "non-strict" semantics.
-  TaskStatus status1;
-  status1.mutable_task_id()->CopyFrom(task1.task_id());
-  status1.mutable_slave_id()->CopyFrom(slaveId);
-  status1.set_state(TASK_STAGING); // Dummy value.
+  AWAIT_READY(runningAgainStatus1);
+  EXPECT_EQ(TASK_RUNNING, runningAgainStatus1->state());
 
-  Future<TaskStatus> reconcileUpdate1;
-  EXPECT_CALL(sched1, statusUpdate(&driver1, _))
-    .WillOnce(FutureArg<1>(&reconcileUpdate1));
-
-  driver1.reconcileTasks({status1});
-
-  AWAIT_READY(reconcileUpdate1);
-  EXPECT_EQ(TASK_RUNNING, reconcileUpdate1->state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate1->reason());
-
-  TaskStatus status2;
-  status2.mutable_task_id()->CopyFrom(task2.task_id());
-  status2.mutable_slave_id()->CopyFrom(slaveId);
-  status2.set_state(TASK_STAGING); // Dummy value.
-
-  Future<TaskStatus> reconcileUpdate2;
-  EXPECT_CALL(sched2, statusUpdate(&driver2, _))
-    .WillOnce(FutureArg<1>(&reconcileUpdate2));
-
-  driver2.reconcileTasks({status2});
-
-  AWAIT_READY(reconcileUpdate2);
-  EXPECT_EQ(TASK_RUNNING, reconcileUpdate2->state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate2->reason());
+  AWAIT_READY(runningAgainStatus2);
+  EXPECT_EQ(TASK_RUNNING, runningAgainStatus2->state());
 
   Clock::resume();
 
@@ -1768,7 +1733,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, PartitionedSlaveStatusUpdates)
       taskId1,
       TASK_RUNNING,
       TaskStatus::SOURCE_SLAVE,
-      UUID::random());
+      id::UUID::random());
 
   StatusUpdateMessage message1;
   message1.mutable_update()->CopyFrom(update1);
@@ -1808,7 +1773,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, PartitionedSlaveStatusUpdates)
       taskId2,
       TASK_RUNNING,
       TaskStatus::SOURCE_SLAVE,
-      UUID::random());
+      id::UUID::random());
 
   StatusUpdateMessage message2;
   message2.mutable_update()->CopyFrom(update2);
@@ -2327,20 +2292,36 @@ TEST_F(PartitionTest, PartitionAwareTaskCompletedOnPartitionedAgent)
   Future<UpdateFrameworkMessage> frameworkUpdate = DROP_PROTOBUF(
       UpdateFrameworkMessage(), master.get()->pid, slave.get()->pid);
 
-  Future<TaskStatus> finishedStatus;
+  // The `finsihedStatusFromMaster` status update is sent as
+  // part of agent's re-registration with the master.
+  // The second status update `finsihedStatusFromAgent` here
+  // is sent by the agent's status update manager after it
+  // re-regsiters.
+  Future<TaskStatus> finsihedStatusFromMaster;
+  Future<TaskStatus> finsihedStatusFromAgent;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&finishedStatus));
+    .WillOnce(FutureArg<1>(&finsihedStatusFromMaster))
+    .WillOnce(FutureArg<1>(&finsihedStatusFromAgent));
 
   detector.appoint(master.get()->pid);
 
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregistered);
+
+  AWAIT_READY(finsihedStatusFromMaster);
+  EXPECT_EQ(TASK_FINISHED, finsihedStatusFromMaster->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, finsihedStatusFromMaster->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REREGISTERED,
+      finsihedStatusFromMaster->reason());
+  EXPECT_EQ(task.task_id(), finsihedStatusFromMaster->task_id());
+
   AWAIT_READY(frameworkUpdate);
 
-  AWAIT_READY(finishedStatus);
-  EXPECT_EQ(TASK_FINISHED, finishedStatus->state());
-  EXPECT_EQ(task.task_id(), finishedStatus->task_id());
-  EXPECT_EQ(slaveId, finishedStatus->slave_id());
+  AWAIT_READY(finsihedStatusFromAgent);
+  EXPECT_EQ(TASK_FINISHED, finsihedStatusFromAgent->state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, finsihedStatusFromAgent->source());
+  EXPECT_EQ(task.task_id(), finsihedStatusFromAgent->task_id());
+  EXPECT_EQ(slaveId, finsihedStatusFromAgent->slave_id());
 
   // Perform explicit reconciliation. The task should not be running.
   TaskStatus status;
@@ -2574,7 +2555,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCount)
   // the unreachable list; hence `unreachable_time` should be set on
   // the result of the reconciliation request.
   TaskStatus status1;
-  status1.mutable_task_id()->set_value(UUID::random().toString());
+  status1.mutable_task_id()->set_value(id::UUID::random().toString());
   status1.mutable_slave_id()->CopyFrom(slaveId1);
   status1.set_state(TASK_STAGING); // Dummy value.
 
@@ -2597,7 +2578,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCount)
   // Because the agent has been removed from the unreachable list in
   // the registry, `unreachable_time` should NOT be set.
   TaskStatus status2;
-  status2.mutable_task_id()->set_value(UUID::random().toString());
+  status2.mutable_task_id()->set_value(id::UUID::random().toString());
   status2.mutable_slave_id()->CopyFrom(slaveId1);
   status2.set_state(TASK_STAGING); // Dummy value.
 
@@ -2616,7 +2597,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCount)
   // partitioned slave. Because the agent is still in the unreachable
   // list in the registry, `unreachable_time` should be set.
   TaskStatus status3;
-  status3.mutable_task_id()->set_value(UUID::random().toString());
+  status3.mutable_task_id()->set_value(id::UUID::random().toString());
   status3.mutable_slave_id()->CopyFrom(slaveId2);
   status3.set_state(TASK_STAGING); // Dummy value.
 
@@ -2669,7 +2650,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCountManySlaves)
   vector<SlaveID> slaveIDs;
   for (int i = 0; i < 50; i++) {
     SlaveID slaveID;
-    slaveID.set_value(UUID::random().toString());
+    slaveID.set_value(id::UUID::random().toString());
     slaveIDs.push_back(slaveID);
 
     SlaveInfo slaveInfo;
@@ -2678,14 +2659,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCountManySlaves)
 
     Future<bool> admitApply =
       master.get()->registrar->unmocked_apply(
-          Owned<master::Operation>(
+          Owned<master::RegistryOperation>(
               new master::AdmitSlave(slaveInfo)));
 
     AWAIT_EXPECT_TRUE(admitApply);
 
     Future<bool> unreachableApply =
       master.get()->registrar->unmocked_apply(
-          Owned<master::Operation>(
+          Owned<master::RegistryOperation>(
               new master::MarkSlaveUnreachable(slaveInfo, unreachableTime)));
 
     AWAIT_EXPECT_TRUE(unreachableApply);
@@ -2725,7 +2706,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCountManySlaves)
   SlaveID removedSlaveID = *(slaveIDs.crbegin() + 1);
 
   TaskStatus status1;
-  status1.mutable_task_id()->set_value(UUID::random().toString());
+  status1.mutable_task_id()->set_value(id::UUID::random().toString());
   status1.mutable_slave_id()->CopyFrom(keptSlaveID);
   status1.set_state(TASK_STAGING); // Dummy value.
 
@@ -2741,7 +2722,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByCountManySlaves)
   EXPECT_EQ(unreachableTime, reconcileUpdate1->unreachable_time());
 
   TaskStatus status2;
-  status2.mutable_task_id()->set_value(UUID::random().toString());
+  status2.mutable_task_id()->set_value(id::UUID::random().toString());
   status2.mutable_slave_id()->CopyFrom(removedSlaveID);
   status2.set_state(TASK_STAGING); // Dummy value.
 
@@ -2938,7 +2919,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByAge)
   // Since neither slave has exceeded the age-based GC bound, we
   // expect to find both slaves (i.e., `unreachable_time` will be set).
   TaskStatus status1;
-  status1.mutable_task_id()->set_value(UUID::random().toString());
+  status1.mutable_task_id()->set_value(id::UUID::random().toString());
   status1.mutable_slave_id()->CopyFrom(slaveId1);
   status1.set_state(TASK_STAGING); // Dummy value.
 
@@ -2954,7 +2935,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByAge)
   EXPECT_EQ(partitionTime1, reconcileUpdate1->unreachable_time());
 
   TaskStatus status2;
-  status2.mutable_task_id()->set_value(UUID::random().toString());
+  status2.mutable_task_id()->set_value(id::UUID::random().toString());
   status2.mutable_slave_id()->CopyFrom(slaveId2);
   status2.set_state(TASK_STAGING); // Dummy value.
 
@@ -2977,7 +2958,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByAge)
   // We expect `slave1` to have been garbage collected, but `slave2`
   // should still be present in the registry.
   TaskStatus status3;
-  status3.mutable_task_id()->set_value(UUID::random().toString());
+  status3.mutable_task_id()->set_value(id::UUID::random().toString());
   status3.mutable_slave_id()->CopyFrom(slaveId1);
   status3.set_state(TASK_STAGING); // Dummy value.
 
@@ -2993,7 +2974,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByAge)
   EXPECT_FALSE(reconcileUpdate3->has_unreachable_time());
 
   TaskStatus status4;
-  status4.mutable_task_id()->set_value(UUID::random().toString());
+  status4.mutable_task_id()->set_value(id::UUID::random().toString());
   status4.mutable_slave_id()->CopyFrom(slaveId2);
   status4.set_state(TASK_STAGING); // Dummy value.
 
@@ -3016,7 +2997,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcByAge)
   // expect that it has been garbage collected, which means
   // `unreachable_time` will not be set.
   TaskStatus status5;
-  status5.mutable_task_id()->set_value(UUID::random().toString());
+  status5.mutable_task_id()->set_value(id::UUID::random().toString());
   status5.mutable_slave_id()->CopyFrom(slaveId2);
   status5.set_state(TASK_STAGING); // Dummy value.
 
@@ -3207,7 +3188,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcRace)
   // Cause `slave2` to reregister with the master. We expect the
   // master to update the registry to mark the slave as reachable; we
   // intercept the registry operation.
-  Future<Owned<master::Operation>> markReachable;
+  Future<Owned<master::RegistryOperation>> markReachable;
   Promise<bool> markReachableContinue;
   EXPECT_CALL(*master.get()->registrar, apply(_))
     .WillOnce(DoAll(FutureArg<0>(&markReachable),
@@ -3227,7 +3208,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcRace)
   // this should result in attempting to prune `slave1` and `slave2`
   // from the unreachable list. We intercept the registry operation to
   // force the race condition with the reregistration of `slave2`.
-  Future<Owned<master::Operation>> prune;
+  Future<Owned<master::RegistryOperation>> prune;
   Promise<bool> pruneContinue;
   EXPECT_CALL(*master.get()->registrar, apply(_))
     .WillOnce(DoAll(FutureArg<0>(&prune),
@@ -3270,7 +3251,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcRace)
   // unreachable list. We use reconciliation to verify this.
 
   TaskStatus status1;
-  status1.mutable_task_id()->set_value(UUID::random().toString());
+  status1.mutable_task_id()->set_value(id::UUID::random().toString());
   status1.mutable_slave_id()->CopyFrom(slaveId1);
   status1.set_state(TASK_STAGING); // Dummy value.
 
@@ -3286,7 +3267,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcRace)
   EXPECT_FALSE(reconcileUpdate1->has_unreachable_time());
 
   TaskStatus status2;
-  status2.mutable_task_id()->set_value(UUID::random().toString());
+  status2.mutable_task_id()->set_value(id::UUID::random().toString());
   status2.mutable_slave_id()->CopyFrom(slaveId2);
   status2.set_state(TASK_STAGING); // Dummy value.
 
@@ -3302,7 +3283,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(PartitionTest, RegistryGcRace)
   EXPECT_FALSE(reconcileUpdate2->has_unreachable_time());
 
   TaskStatus status3;
-  status3.mutable_task_id()->set_value(UUID::random().toString());
+  status3.mutable_task_id()->set_value(id::UUID::random().toString());
   status3.mutable_slave_id()->CopyFrom(slaveId3);
   status3.set_state(TASK_STAGING); // Dummy value.
 
@@ -3390,7 +3371,7 @@ TEST_F(PartitionTest, FailHealthChecksTwice)
   Future<Nothing> unreachableDispatch1 =
     FUTURE_DISPATCH(master.get()->pid, &Master::markUnreachable);
 
-  Future<Owned<master::Operation>> markUnreachable;
+  Future<Owned<master::RegistryOperation>> markUnreachable;
   Promise<bool> markUnreachableContinue;
   EXPECT_CALL(*master.get()->registrar, apply(_))
     .WillOnce(DoAll(FutureArg<0>(&markUnreachable),

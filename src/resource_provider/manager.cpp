@@ -89,7 +89,7 @@ struct HttpConnection
 {
   HttpConnection(const http::Pipe::Writer& _writer,
                  ContentType _contentType,
-                 UUID _streamId)
+                 id::UUID _streamId)
     : writer(_writer),
       contentType(_contentType),
       streamId(_streamId),
@@ -116,7 +116,7 @@ struct HttpConnection
 
   http::Pipe::Writer writer;
   ContentType contentType;
-  UUID streamId;
+  id::UUID streamId;
   ::recordio::Encoder<v1::resource_provider::Event> encoder;
 };
 
@@ -131,6 +131,8 @@ struct ResourceProvider
 
   ~ResourceProvider()
   {
+    LOG(INFO) << "Terminating resource provider " << info.id();
+
     http.close();
 
     foreachvalue (const Owned<Promise<Nothing>>& publish, publishes) {
@@ -142,7 +144,7 @@ struct ResourceProvider
 
   ResourceProviderInfo info;
   HttpConnection http;
-  hashmap<UUID, Owned<Promise<Nothing>>> publishes;
+  hashmap<id::UUID, Owned<Promise<Nothing>>> publishes;
 };
 
 
@@ -156,9 +158,14 @@ public:
       const http::Request& request,
       const Option<Principal>& principal);
 
-  void applyOfferOperation(const ApplyOfferOperationMessage& message);
+  void applyOperation(const ApplyOperationMessage& message);
 
-  Future<Nothing> publish(const Resources& resources);
+  void acknowledgeOperationStatus(
+      const AcknowledgeOperationStatusMessage& message);
+
+  void reconcileOperations(const ReconcileOperationsMessage& message);
+
+  Future<Nothing> publishResources(const Resources& resources);
 
   Queue<ResourceProviderMessage> messages;
 
@@ -167,17 +174,17 @@ private:
       const HttpConnection& http,
       const Call::Subscribe& subscribe);
 
-  void updateOfferOperationStatus(
+  void updateOperationStatus(
       ResourceProvider* resourceProvider,
-      const Call::UpdateOfferOperationStatus& update);
+      const Call::UpdateOperationStatus& update);
 
   void updateState(
       ResourceProvider* resourceProvider,
       const Call::UpdateState& update);
 
-  void updatePublishStatus(
+  void updatePublishResourcesStatus(
       ResourceProvider* resourceProvider,
-      const Call::UpdatePublishStatus& update);
+      const Call::UpdatePublishResourcesStatus& update);
 
   ResourceProviderID newResourceProviderId();
 
@@ -272,7 +279,7 @@ Future<http::Response> ResourceProviderManagerProcess::api(
     ok.reader = pipe.reader();
 
     // Generate a stream ID and return it in the response.
-    UUID streamId = UUID::random();
+    id::UUID streamId = id::UUID::random();
     ok.headers["Mesos-Stream-Id"] = streamId.toString();
 
     HttpConnection http(pipe.writer(), acceptType, streamId);
@@ -312,10 +319,10 @@ Future<http::Response> ResourceProviderManagerProcess::api(
       LOG(FATAL) << "Unexpected 'SUBSCRIBE' call";
     }
 
-    case Call::UPDATE_OFFER_OPERATION_STATUS: {
-      updateOfferOperationStatus(
+    case Call::UPDATE_OPERATION_STATUS: {
+      updateOperationStatus(
           resourceProvider,
-          call.update_offer_operation_status());
+          call.update_operation_status());
 
       return Accepted();
     }
@@ -325,8 +332,10 @@ Future<http::Response> ResourceProviderManagerProcess::api(
       return Accepted();
     }
 
-    case Call::UPDATE_PUBLISH_STATUS: {
-      updatePublishStatus(resourceProvider, call.update_publish_status());
+    case Call::UPDATE_PUBLISH_RESOURCES_STATUS: {
+      updatePublishResourcesStatus(
+          resourceProvider,
+          call.update_publish_resources_status());
       return Accepted();
     }
   }
@@ -335,26 +344,19 @@ Future<http::Response> ResourceProviderManagerProcess::api(
 }
 
 
-void ResourceProviderManagerProcess::applyOfferOperation(
-    const ApplyOfferOperationMessage& message)
+void ResourceProviderManagerProcess::applyOperation(
+    const ApplyOperationMessage& message)
 {
   const Offer::Operation& operation = message.operation_info();
   const FrameworkID& frameworkId = message.framework_id();
-
-  Try<UUID> uuid = UUID::fromBytes(message.operation_uuid());
-  if (uuid.isError()) {
-    LOG(ERROR) << "Failed to parse offer operation UUID for operation "
-               << "'" << operation.id() << "' from framework "
-               << frameworkId << ": " << uuid.error();
-    return;
-  }
+  const UUID& operationUUID = message.operation_uuid();
 
   Result<ResourceProviderID> resourceProviderId =
     getResourceProviderId(operation);
 
   if (!resourceProviderId.isSome()) {
     LOG(ERROR) << "Failed to get the resource provider ID of operation "
-               << "'" << operation.id() << "' (uuid: " << uuid->toString()
+               << "'" << operation.id() << "' (uuid: " << operationUUID
                << ") from framework " << frameworkId << ": "
                << (resourceProviderId.isError() ? resourceProviderId.error()
                                                 : "Not found");
@@ -363,7 +365,7 @@ void ResourceProviderManagerProcess::applyOfferOperation(
 
   if (!resourceProviders.subscribed.contains(resourceProviderId.get())) {
     LOG(WARNING) << "Dropping operation '" << operation.id() << "' (uuid: "
-                 << uuid.get() << ") from framework " << frameworkId
+                 << operationUUID << ") from framework " << frameworkId
                  << " because resource provider " << resourceProviderId.get()
                  << " is not subscribed";
     return;
@@ -382,23 +384,121 @@ void ResourceProviderManagerProcess::applyOfferOperation(
     << resourceProviderId.get();
 
   Event event;
-  event.set_type(Event::OPERATION);
-  event.mutable_operation()->mutable_framework_id()->CopyFrom(frameworkId);
-  event.mutable_operation()->mutable_info()->CopyFrom(operation);
-  event.mutable_operation()->set_operation_uuid(message.operation_uuid());
-  event.mutable_operation()->set_resource_version_uuid(
-      message.resource_version_uuid().uuid());
+  event.set_type(Event::APPLY_OPERATION);
+  event.mutable_apply_operation()
+    ->mutable_framework_id()->CopyFrom(frameworkId);
+  event.mutable_apply_operation()->mutable_info()->CopyFrom(operation);
+  event.mutable_apply_operation()
+    ->mutable_operation_uuid()->CopyFrom(message.operation_uuid());
+  event.mutable_apply_operation()
+    ->mutable_resource_version_uuid()
+    ->CopyFrom(message.resource_version_uuid().uuid());
 
   if (!resourceProvider->http.send(event)) {
     LOG(WARNING) << "Failed to send operation '" << operation.id() << "' "
-                 << "(uuid: " << uuid.get() << ") from framework "
+                 << "(uuid: " << operationUUID << ") from framework "
                  << frameworkId << " to resource provider "
                  << resourceProviderId.get() << ": connection closed";
   }
 }
 
 
-Future<Nothing> ResourceProviderManagerProcess::publish(
+void ResourceProviderManagerProcess::acknowledgeOperationStatus(
+    const AcknowledgeOperationStatusMessage& message)
+{
+  CHECK(message.has_resource_provider_id());
+
+  if (!resourceProviders.subscribed.contains(message.resource_provider_id())) {
+    LOG(WARNING) << "Dropping operation status acknowledgement with"
+                 << " status_uuid " << message.status_uuid() << " and"
+                 << " operation_uuid " << message.operation_uuid() << " because"
+                 << " resource provider " << message.resource_provider_id()
+                 << " is not subscribed";
+    return;
+  }
+
+  ResourceProvider& resourceProvider =
+    *resourceProviders.subscribed.at(message.resource_provider_id());
+
+  Event event;
+  event.set_type(Event::ACKNOWLEDGE_OPERATION_STATUS);
+  event.mutable_acknowledge_operation_status()
+    ->mutable_status_uuid()
+    ->CopyFrom(message.status_uuid());
+  event.mutable_acknowledge_operation_status()
+    ->mutable_operation_uuid()
+    ->CopyFrom(message.operation_uuid());
+
+  if (!resourceProvider.http.send(event)) {
+    LOG(WARNING) << "Failed to send operation status acknowledgement with"
+                 << " status_uuid " << message.status_uuid() << " and"
+                 << " operation_uuid " << message.operation_uuid() << " to"
+                 << " resource provider " << message.resource_provider_id()
+                 << ": connection closed";
+  }
+}
+
+
+void ResourceProviderManagerProcess::reconcileOperations(
+    const ReconcileOperationsMessage& message)
+{
+  hashmap<ResourceProviderID, Event> events;
+
+  auto addOperation =
+    [&events](const ReconcileOperationsMessage::Operation& operation) {
+      const ResourceProviderID resourceProviderId =
+        operation.resource_provider_id();
+
+      if (events.contains(resourceProviderId)) {
+        events.at(resourceProviderId).mutable_reconcile_operations()
+          ->add_operation_uuids()->CopyFrom(operation.operation_uuid());
+      } else {
+        Event event;
+        event.set_type(Event::RECONCILE_OPERATIONS);
+        event.mutable_reconcile_operations()
+          ->add_operation_uuids()->CopyFrom(operation.operation_uuid());
+
+        events[resourceProviderId] = event;
+      }
+  };
+
+  // Construct events for individual resource providers.
+  foreach (
+      const ReconcileOperationsMessage::Operation& operation,
+      message.operations()) {
+    if (operation.has_resource_provider_id()) {
+      if (!resourceProviders.subscribed.contains(
+              operation.resource_provider_id())) {
+        LOG(WARNING) << "Dropping operation reconciliation message with"
+                     << " operation_uuid " << operation.operation_uuid()
+                     << " because resource provider "
+                     << operation.resource_provider_id()
+                     << " is not subscribed";
+        continue;
+      }
+
+      addOperation(operation);
+    }
+  }
+
+  foreachpair (
+      const ResourceProviderID& resourceProviderId,
+      const Event& event,
+      events) {
+    CHECK(resourceProviders.subscribed.contains(resourceProviderId));
+    ResourceProvider& resourceProvider =
+      *resourceProviders.subscribed.at(resourceProviderId);
+
+    if (!resourceProvider.http.send(event)) {
+      LOG(WARNING) << "Failed to send operation reconciliation event"
+                   << " to resource provider " << resourceProviderId
+                   << ": connection closed";
+    }
+  }
+}
+
+
+Future<Nothing> ResourceProviderManagerProcess::publishResources(
     const Resources& resources)
 {
   hashmap<ResourceProviderID, Resources> providedResources;
@@ -430,19 +530,24 @@ Future<Nothing> ResourceProviderManagerProcess::publish(
   foreachpair (const ResourceProviderID& resourceProviderId,
                const Resources& resources,
                providedResources) {
-    UUID uuid = UUID::random();
+    id::UUID uuid = id::UUID::random();
 
     Event event;
-    event.set_type(Event::PUBLISH);
-    event.mutable_publish()->set_uuid(uuid.toBytes());
-    event.mutable_publish()->mutable_resources()->CopyFrom(resources);
+    event.set_type(Event::PUBLISH_RESOURCES);
+    event.mutable_publish_resources()
+      ->mutable_uuid()->set_value(uuid.toBytes());
+    event.mutable_publish_resources()->mutable_resources()->CopyFrom(resources);
 
     ResourceProvider* resourceProvider =
       resourceProviders.subscribed.at(resourceProviderId).get();
 
+    LOG(INFO)
+      << "Sending PUBLISH event " << uuid << " with resources '" << resources
+      << "' to resource provider " << resourceProviderId;
+
     if (!resourceProvider->http.send(event)) {
       return Failure(
-          "Failed to send PUBLISH event to resource provider " +
+          "Failed to send PUBLISH_RESOURCES event to resource provider " +
           stringify(resourceProviderId) + ": connection closed");
     }
 
@@ -495,12 +600,26 @@ void ResourceProviderManagerProcess::subscribe(
   }
 
   http.closed()
-    .onAny(defer(self(), [=](const Future<Nothing>&) {
-      CHECK(resourceProviders.subscribed.contains(resourceProviderId));
+    .onAny(defer(self(), [=](const Future<Nothing>& future) {
+      // Iff the remote side closes the HTTP connection, the future will be
+      // ready. We will remove the resource provider in that case.
+      // This side closes the HTTP connection only when removing a resource
+      // provider, therefore we shouldn't try to remove it again here.
+      if (future.isReady()) {
+        CHECK(resourceProviders.subscribed.contains(resourceProviderId));
 
-      // NOTE: All pending futures of publish requests for the resource
-      // provider will become failed.
-      resourceProviders.subscribed.erase(resourceProviderId);
+        // NOTE: All pending futures of publish requests for the resource
+        // provider will become failed.
+        resourceProviders.subscribed.erase(resourceProviderId);
+      }
+
+      ResourceProviderMessage::Disconnect disconnect{resourceProviderId};
+
+      ResourceProviderMessage message;
+      message.type = ResourceProviderMessage::Type::DISCONNECT;
+      message.disconnect = std::move(disconnect);
+
+      messages.put(std::move(message));
     }));
 
   // TODO(jieyu): Start heartbeat for the resource provider.
@@ -510,21 +629,21 @@ void ResourceProviderManagerProcess::subscribe(
 }
 
 
-void ResourceProviderManagerProcess::updateOfferOperationStatus(
+void ResourceProviderManagerProcess::updateOperationStatus(
     ResourceProvider* resourceProvider,
-    const Call::UpdateOfferOperationStatus& update)
+    const Call::UpdateOperationStatus& update)
 {
-  ResourceProviderMessage::UpdateOfferOperationStatus body;
+  ResourceProviderMessage::UpdateOperationStatus body;
   body.update.mutable_framework_id()->CopyFrom(update.framework_id());
   body.update.mutable_status()->CopyFrom(update.status());
-  body.update.set_operation_uuid(update.operation_uuid());
+  body.update.mutable_operation_uuid()->CopyFrom(update.operation_uuid());
   if (update.has_latest_status()) {
     body.update.mutable_latest_status()->CopyFrom(update.latest_status());
   }
 
   ResourceProviderMessage message;
-  message.type = ResourceProviderMessage::Type::UPDATE_OFFER_OPERATION_STATUS;
-  message.updateOfferOperationStatus = std::move(body);
+  message.type = ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS;
+  message.updateOperationStatus = std::move(body);
 
   messages.put(std::move(message));
 }
@@ -540,18 +659,31 @@ void ResourceProviderManagerProcess::updateState(
 
   // TODO(chhsiao): Report pending operations.
 
-  Try<UUID> resourceVersionUuid =
-    UUID::fromBytes(update.resource_version_uuid());
+  Try<id::UUID> resourceVersion =
+    id::UUID::fromBytes(update.resource_version_uuid().value());
 
-  CHECK_SOME(resourceVersionUuid)
+  CHECK_SOME(resourceVersion)
     << "Could not deserialize version of resource provider "
-    << resourceProvider->info.id() << ": " << resourceVersionUuid.error();
+    << resourceProvider->info.id() << ": " << resourceVersion.error();
+
+  hashmap<id::UUID, Operation> operations;
+  foreach (const Operation &operation, update.operations()) {
+    Try<id::UUID> uuid = id::UUID::fromBytes(operation.uuid().value());
+    CHECK_SOME(uuid);
+
+    operations.put(uuid.get(), operation);
+  }
+
+  LOG(INFO)
+    << "Received UPDATE_STATE call with resources '" << update.resources()
+    << "' and " << operations.size() << " operations from resource provider "
+    << resourceProvider->info.id();
 
   ResourceProviderMessage::UpdateState updateState{
-      resourceProvider->info.id(),
-      resourceVersionUuid.get(),
+      resourceProvider->info,
+      resourceVersion.get(),
       update.resources(),
-      {update.operations().begin(), update.operations().end()}};
+      std::move(operations)};
 
   ResourceProviderMessage message;
   message.type = ResourceProviderMessage::Type::UPDATE_STATE;
@@ -561,29 +693,35 @@ void ResourceProviderManagerProcess::updateState(
 }
 
 
-void ResourceProviderManagerProcess::updatePublishStatus(
+void ResourceProviderManagerProcess::updatePublishResourcesStatus(
     ResourceProvider* resourceProvider,
-    const Call::UpdatePublishStatus& update)
+    const Call::UpdatePublishResourcesStatus& update)
 {
-  Try<UUID> uuid = UUID::fromBytes(update.uuid());
+  Try<id::UUID> uuid = id::UUID::fromBytes(update.uuid().value());
   if (uuid.isError()) {
-    LOG(ERROR) << "Invalid UUID in UpdatePublishStatus from resource provider "
-               << resourceProvider->info.id() << ": " << uuid.error();
+    LOG(ERROR) << "Invalid UUID in UpdatePublishResourcesStatus from resource"
+               << " provider " << resourceProvider->info.id()
+               << ": " << uuid.error();
     return;
   }
 
   if (!resourceProvider->publishes.contains(uuid.get())) {
-    LOG(ERROR) << "Ignoring UpdatePublishStatus from resource provider "
-               << resourceProvider->info.id() << " because UUID "
-               << uuid->toString() << " is unknown";
+    LOG(ERROR) << "Ignoring UpdatePublishResourcesStatus from resource"
+               << " provider " << resourceProvider->info.id()
+               << " because UUID " << uuid->toString() << " is unknown";
     return;
   }
 
-  if (update.status() == Call::UpdatePublishStatus::OK) {
+  LOG(INFO)
+    << "Received UPDATE_PUBLISH_RESOURCES_STATUS call for PUBLISH_RESOURCES"
+    << " event " << uuid.get() << " with " << update.status()
+    << " status from resource provider " << resourceProvider->info.id();
+
+  if (update.status() == Call::UpdatePublishResourcesStatus::OK) {
     resourceProvider->publishes.at(uuid.get())->set(Nothing());
   } else {
     // TODO(jieyu): Consider to include an error message in
-    // 'UpdatePublishStatus' and surface that to the caller.
+    // 'UpdatePublishResourcesStatus' and surface that to the caller.
     resourceProvider->publishes.at(uuid.get())->fail(
         "Failed to publish resources for resource provider " +
         stringify(resourceProvider->info.id()) + ": Received " +
@@ -597,7 +735,7 @@ void ResourceProviderManagerProcess::updatePublishStatus(
 ResourceProviderID ResourceProviderManagerProcess::newResourceProviderId()
 {
   ResourceProviderID resourceProviderId;
-  resourceProviderId.set_value(UUID::random().toString());
+  resourceProviderId.set_value(id::UUID::random().toString());
   return resourceProviderId;
 }
 
@@ -628,21 +766,42 @@ Future<http::Response> ResourceProviderManager::api(
 }
 
 
-void ResourceProviderManager::applyOfferOperation(
-    const ApplyOfferOperationMessage& message) const
+void ResourceProviderManager::applyOperation(
+    const ApplyOperationMessage& message) const
 {
   return dispatch(
       process.get(),
-      &ResourceProviderManagerProcess::applyOfferOperation,
+      &ResourceProviderManagerProcess::applyOperation,
       message);
 }
 
 
-Future<Nothing> ResourceProviderManager::publish(const Resources& resources)
+void ResourceProviderManager::acknowledgeOperationStatus(
+    const AcknowledgeOperationStatusMessage& message) const
 {
   return dispatch(
       process.get(),
-      &ResourceProviderManagerProcess::publish,
+      &ResourceProviderManagerProcess::acknowledgeOperationStatus,
+      message);
+}
+
+
+void ResourceProviderManager::reconcileOperations(
+    const ReconcileOperationsMessage& message) const
+{
+  return dispatch(
+      process.get(),
+      &ResourceProviderManagerProcess::reconcileOperations,
+      message);
+}
+
+
+Future<Nothing> ResourceProviderManager::publishResources(
+    const Resources& resources)
+{
+  return dispatch(
+      process.get(),
+      &ResourceProviderManagerProcess::publishResources,
       resources);
 }
 

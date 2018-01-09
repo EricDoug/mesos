@@ -111,6 +111,17 @@ mesos::internal::slave::Flags::Flags()
       "  \"name\": \"lvm\"\n"
       "}");
 
+#ifdef ENABLE_GRPC
+  add(&Flags::volume_profile_adaptor,
+      "volume_profile_adaptor",
+      "The name of the volume profile adaptor module that storage resource\n"
+      "providers should use for translating a 'volume profile' into inputs\n"
+      "consumed by various Container Storage Interface (CSI) plugins.\n"
+      "If this flag is not specified, the default behavior for storage\n"
+      "resource providers is to only expose resources for pre-existing\n"
+      "volumes and not publish RAW volumes.");
+#endif
+
   add(&Flags::isolation,
       "isolation",
       "Isolation mechanisms to use, e.g., `posix/cpu,posix/mem` (or \n"
@@ -153,6 +164,28 @@ mesos::internal::slave::Flags::Flags()
       "image_provisioner_backend",
       "Strategy for provisioning container rootfs from images,\n"
       "e.g., `aufs`, `bind`, `copy`, `overlay`.");
+
+  add(&Flags::image_gc_config,
+      "image_gc_config",
+      "JSON-formatted configuration for automatic container image garbage\n"
+      "collection. This is an optional flag. If it is not set, it means\n"
+      "the automatic container image gc is not enabled. Users have to\n"
+      "trigger image gc manually via the operator API. If it is set, the\n"
+      "auto image gc is enabled. This image gc config can be provided either\n"
+      "as a path pointing to a local file, or as a JSON-formatted string.\n"
+      "Please note that the image garbage collection only work with Mesos\n"
+      "Containerizer for now."
+      "\n"
+      "See the ImageGcConfig message in `flags.proto` for the expected\n"
+      "format.\n"
+      "Example:\n"
+      "{\n"
+      "  \"image_disk_headroom\": 0.1,\n"
+      "  \"image_disk_watch_interval\": {\n"
+      "    \"nanoseconds\": 3600\n"
+      "  },\n"
+      "  \"excluded_images\": []\n"
+      "}");
 
   add(&Flags::appc_simple_discovery_uri_prefix,
       "appc_simple_discovery_uri_prefix",
@@ -459,6 +492,20 @@ mesos::internal::slave::Flags::Flags()
       "sucessfully reconnect to the framework.",
       RECOVERY_TIMEOUT);
 
+  add(&Flags::reconfiguration_policy,
+      "reconfiguration_policy",
+      "This flag controls which agent configuration changes are considered\n"
+      "acceptable when recovering the previous agent state. Possible values:\n"
+      "equal:    The old and the new state must match exactly.\n"
+      "additive: The new state must be a superset of the old state:\n"
+      "          it is permitted to add additional resources, attributes\n"
+      "          and domains but not to remove or to modify existing ones.\n"
+      "Note that this only affects the checking done on the agent itself,\n"
+      "the master may still reject the agent if it detects a change that it\n"
+      "considers unacceptable, which, e.g., currently happens when port or\n"
+      "hostname are changed.",
+      "equal");
+
   add(&Flags::strict,
       "strict",
       "If `strict=true`, any and all recovery errors are considered fatal.\n"
@@ -649,6 +696,17 @@ mesos::internal::slave::Flags::Flags()
       "This flag has the same syntax as `--effective_capabilities`."
      );
 
+  add(&Flags::disallow_sharing_agent_pid_namespace,
+      "disallow_sharing_agent_pid_namespace",
+      "If set to `true`, each top-level container will have its own pid\n"
+      "namespace, and if the framework requests to share the agent pid\n"
+      "namespace for the top level container, the container launch will be\n"
+      "rejected. If set to `false`, the top-level containers will share the\n"
+      "pid namespace with agent if the framework requests it. This flag will\n"
+      "be ignored if the `namespaces/pid` isolator is not enabled.\n",
+      false);
+#endif
+
   add(&Flags::agent_features,
       "agent_features",
       "JSON representation of agent features to whitelist. We always require\n"
@@ -679,17 +737,6 @@ mesos::internal::slave::Flags::Flags()
 
         return None();
       });
-
-  add(&Flags::disallow_sharing_agent_pid_namespace,
-      "disallow_sharing_agent_pid_namespace",
-      "If set to `true`, each top-level container will have its own pid\n"
-      "namespace, and if the framework requests to share the agent pid\n"
-      "namespace for the top level container, the container launch will be\n"
-      "rejected. If set to `false`, the top-level containers will share the\n"
-      "pid namespace with agent if the framework requests it. This flag will\n"
-      "be ignored if the `namespaces/pid` isolator is not enabled.\n",
-      false);
-#endif
 
   add(&Flags::firewall_rules,
       "firewall_rules",

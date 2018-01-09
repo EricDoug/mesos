@@ -156,6 +156,9 @@ Option<Error> validate(
     case mesos::agent::Call::GET_AGENT:
       return None();
 
+    case mesos::agent::Call::GET_RESOURCE_PROVIDERS:
+      return None();
+
     case mesos::agent::Call::LAUNCH_NESTED_CONTAINER: {
       if (!call.has_launch_nested_container()) {
         return Error("Expecting 'launch_nested_container' to be present");
@@ -485,6 +488,47 @@ Option<Error> validate(
 
       return None();
     }
+
+    case mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_add_resource_provider_config()) {
+        return Error(
+            "Expecting 'add_resource_provider_config' to be present");
+      }
+
+      if (call.add_resource_provider_config().info().has_id()) {
+        return Error(
+            "Expecting 'add_resource_provider_config.info.id' to be unset");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_update_resource_provider_config()) {
+        return Error(
+            "Expecting 'update_resource_provider_config' to be present");
+      }
+
+      if (call.update_resource_provider_config().info().has_id()) {
+        return Error(
+            "Expecting 'update_resource_provider_config.info.id' to be unset");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_remove_resource_provider_config()) {
+        return Error(
+            "Expecting 'remove_resource_provider_config' to be present");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::PRUNE_IMAGES: {
+      return None();
+    }
   }
 
   UNREACHABLE();
@@ -535,7 +579,7 @@ Option<Error> validate(const mesos::executor::Call& call)
         return Error("Expecting 'uuid' to be present");
       }
 
-      Try<UUID> uuid = UUID::fromBytes(status.uuid());
+      Try<id::UUID> uuid = id::UUID::fromBytes(status.uuid());
       if (uuid.isError()) {
         return uuid.error();
       }

@@ -1258,7 +1258,7 @@ void finalize(bool finalize_wsa)
   // potentially dereference it.
   socket_manager->finalize();
 
-  // This is dereferenced inside `ProcessBase::visit(HttpEvent&)`.
+  // This is dereferenced inside `ProcessBase::consume(HttpEvent&&)`.
   // We can safely delete it since no further incoming HTTP connections
   // can be made because the server socket has been destroyed. This must
   // be deleted before the `ProcessManager` as it will indirectly
@@ -2816,8 +2816,19 @@ void ProcessManager::resume(ProcessBase* process)
         state == ProcessBase::State::READY);
 
   if (state == ProcessBase::State::BOTTOM) {
-    try { process->initialize(); }
-    catch (...) { terminate = true; }
+    // In the event that the process throws an exception,
+    // we will abort the program.
+    //
+    // TODO(bmahler): Consider providing recovery mechanisms.
+    try {
+      process->initialize();
+    } catch (const std::exception& e) {
+      LOG(FATAL) << "Aborting libprocess: '" << process->pid << "'"
+                 << " threw exception during initialization: " << e.what();
+    } catch (...) {
+      LOG(FATAL) << "Aborting libprocess: '" << process->pid << "'"
+                 << " threw exception during initialization: unknown";
+    }
 
     state = ProcessBase::State::READY;
     process->state.store(state);
@@ -2915,17 +2926,18 @@ void ProcessManager::resume(ProcessBase* process)
       // Determine if we should terminate.
       terminate = event->is<TerminateEvent>();
 
-      // Now service the event.
+      // Now service the event. In the event that the process
+      // throws an exception, we will abort the program.
+      //
+      // TODO(bmahler): Consider providing recovery mechanisms.
       try {
-        process->serve(*event);
+        process->serve(std::move(*event));
       } catch (const std::exception& e) {
-        LOG(ERROR) << "libprocess: " << process->pid
-                   << " terminating due to " << e.what();
-        terminate = true;
+        LOG(FATAL) << "Aborting libprocess: '" << process->pid << "'"
+                   << " threw exception: " << e.what();
       } catch (...) {
-        LOG(ERROR) << "libprocess: " << process->pid
-                   << " terminating due to unknown exception";
-        terminate = true;
+        LOG(FATAL) << "Aborting libprocess: '" << process->pid << "'"
+                   << " threw unknown exception";
       }
 
       delete event;
@@ -2977,7 +2989,7 @@ void ProcessManager::cleanup(ProcessBase* process)
   // Remove help strings for all installed routes for this process.
   dispatch(help, &Help::remove, process->pid.id);
 
-  // Possible gate non-libprocess threads are waiting at.
+    // Possible gate non-libprocess threads are waiting at.
   std::shared_ptr<Gate> gate = process->gate;
 
   // Remove process.
@@ -3476,7 +3488,7 @@ void ProcessBase::send(
 }
 
 
-void ProcessBase::visit(const MessageEvent& event)
+void ProcessBase::consume(MessageEvent&& event)
 {
   if (handlers.message.count(event.message.name) > 0) {
     handlers.message[event.message.name](
@@ -3492,13 +3504,13 @@ void ProcessBase::visit(const MessageEvent& event)
 }
 
 
-void ProcessBase::visit(const DispatchEvent& event)
+void ProcessBase::consume(DispatchEvent&& event)
 {
-  (*event.f)(this);
+  std::move(*event.f)(this);
 }
 
 
-void ProcessBase::visit(const HttpEvent& event)
+void ProcessBase::consume(HttpEvent&& event)
 {
   VLOG(1) << "Handling HTTP event for process '" << pid.id << "'"
           << " with path: '" << event.request->url.path << "'";
@@ -3548,10 +3560,10 @@ void ProcessBase::visit(const HttpEvent& event)
       response = convert(std::move(request))
         .then(defer(self(), [this, endpoint, name](
             const Owned<Request>& request) {
-          return _visit(endpoint, name, request);
+          return _consume(endpoint, name, request);
         }));
     } else {
-      response = _visit(endpoint, name, request);
+      response = _consume(endpoint, name, request);
     }
 
     response
@@ -3609,7 +3621,7 @@ void ProcessBase::visit(const HttpEvent& event)
 }
 
 
-Future<Response> ProcessBase::_visit(
+Future<Response> ProcessBase::_consume(
     const HttpEndpoint& endpoint,
     const string& name,
     const Owned<Request>& request)
@@ -3687,13 +3699,13 @@ Future<Response> ProcessBase::_visit(
 }
 
 
-void ProcessBase::visit(const ExitedEvent& event)
+void ProcessBase::consume(ExitedEvent&& event)
 {
   exited(event.pid);
 }
 
 
-void ProcessBase::visit(const TerminateEvent& event)
+void ProcessBase::consume(TerminateEvent&& event)
 {
   finalize();
 }
@@ -3918,12 +3930,12 @@ namespace internal {
 
 void dispatch(
     const UPID& pid,
-    const std::shared_ptr<lambda::function<void(ProcessBase*)>>& f,
+    std::unique_ptr<lambda::CallableOnce<void(ProcessBase*)>> f,
     const Option<const std::type_info*>& functionType)
 {
   process::initialize();
 
-  DispatchEvent* event = new DispatchEvent(pid, f, functionType);
+  DispatchEvent* event = new DispatchEvent(pid, std::move(f), functionType);
   process_manager->deliver(pid, event, __process__);
 }
 

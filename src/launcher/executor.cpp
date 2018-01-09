@@ -204,7 +204,8 @@ public:
       }
 
       case Event::ACKNOWLEDGED: {
-        const UUID uuid = UUID::fromBytes(event.acknowledged().uuid()).get();
+        const id::UUID uuid =
+          id::UUID::fromBytes(event.acknowledged().uuid()).get();
 
         if (!unacknowledgedUpdates.contains(uuid)) {
           LOG(WARNING) << "Received acknowledgement " << uuid
@@ -308,7 +309,7 @@ protected:
     CHECK_SOME(lastTaskStatus);
     TaskStatus status = protobuf::createTaskStatus(
         lastTaskStatus.get(),
-        UUID::random(),
+        id::UUID::random(),
         Clock::now().secs(),
         None(),
         None(),
@@ -342,7 +343,7 @@ protected:
     CHECK_SOME(lastTaskStatus);
     TaskStatus status = protobuf::createTaskStatus(
         lastTaskStatus.get(),
-        UUID::random(),
+        id::UUID::random(),
         Clock::now().secs(),
         None(),
         None(),
@@ -764,6 +765,8 @@ protected:
     if (launched) {
       CHECK_SOME(taskId);
       kill(taskId.get(), gracePeriod);
+    } else {
+      terminate(self());
     }
   }
 
@@ -773,6 +776,12 @@ private:
     if (terminated) {
       return;
     }
+
+    // Terminate if a kill task request is received before the task is launched.
+    // This can happen, for example, if `RunTaskMessage` has not been delivered.
+    // See MESOS-8297.
+    CHECK(launched) << "Terminating because kill task message has been"
+                    << " received before the task has been launched";
 
     // If the task is being killed but has not terminated yet and
     // we receive another kill request. Check if we need to adjust
@@ -1000,7 +1009,7 @@ private:
     TaskStatus status = protobuf::createTaskStatus(
         _taskId,
         state,
-        UUID::random(),
+        id::UUID::random(),
         Clock::now().secs());
 
     status.mutable_executor_id()->CopyFrom(executorId);
@@ -1059,7 +1068,8 @@ private:
     call.mutable_update()->mutable_status()->CopyFrom(status);
 
     // Capture the status update.
-    unacknowledgedUpdates[UUID::fromBytes(status.uuid()).get()] = call.update();
+    unacknowledgedUpdates[id::UUID::fromBytes(status.uuid()).get()] =
+      call.update();
 
     // Overwrite the last task status.
     lastTaskStatus = status;
@@ -1134,7 +1144,7 @@ private:
   const ExecutorID executorId;
   Owned<MesosBase> mesos;
 
-  LinkedHashMap<UUID, Call::Update> unacknowledgedUpdates;
+  LinkedHashMap<id::UUID, Call::Update> unacknowledgedUpdates;
 
   Option<TaskStatus> lastTaskStatus;
 

@@ -31,6 +31,7 @@
 #include <stout/unreachable.hpp>
 
 #include "csi/spec.hpp"
+#include "csi/state.hpp"
 
 namespace csi {
 
@@ -40,6 +41,9 @@ bool operator==(
 
 
 bool operator==(const Version& left, const Version& right);
+
+
+bool operator==(const VolumeCapability& left, const VolumeCapability& right);
 
 
 bool operator!=(const Version& left, const Version& right);
@@ -114,6 +118,12 @@ struct ControllerCapabilities
   bool getCapacity = false;
 };
 
+
+namespace state {
+
+std::ostream& operator<<(std::ostream& stream, const VolumeState::State& state);
+
+} // namespace state {
 } // namespace csi {
 } // namespace mesos {
 

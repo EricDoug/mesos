@@ -23,6 +23,7 @@
 #include <mesos/mesos.hpp>
 
 #include <stout/try.hpp>
+#include <stout/uuid.hpp>
 
 namespace mesos {
 namespace internal {
@@ -79,6 +80,9 @@ namespace paths {
 //   |           |           |-- latest (symlink)
 //   |           |           |-- <resource_provider_id>
 //   |           |               |-- resource_provider.state
+//   |           |               |-- operations
+//   |           |                   |-- <operation_uuid>
+//   |           |                       |-- operation.updates
 //   |           |-- frameworks
 //   |               |-- <framework_id>
 //   |                   |-- framework.info
@@ -347,6 +351,25 @@ std::string getLatestResourceProviderPath(
     const SlaveID& slaveId,
     const std::string& resourceProviderType,
     const std::string& resourceProviderName);
+
+
+Try<std::list<std::string>> getOperationPaths(
+    const std::string& rootDir);
+
+
+std::string getOperationPath(
+    const std::string& rootDir,
+    const id::UUID& operationUuid);
+
+
+Try<id::UUID> parseOperationPath(
+    const std::string& rootDir,
+    const std::string& dir);
+
+
+std::string getOperationUpdatesPath(
+    const std::string& rootDir,
+    const id::UUID& operationUuid);
 
 
 std::string getResourcesInfoPath(

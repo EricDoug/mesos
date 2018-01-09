@@ -51,6 +51,7 @@ We categorize the changes as follows:
       <li>C <a href="#1-5-x-task-starting">Built-in executors send a TASK_STARTING update</a></li>
       <li>A <a href="#1-5-x-network-ports-isolator">Network ports isolator</a></li>
       <li>C <a href="#1-5-x-relative-disk-source-root-path">Relative source root paths for disk resources</a></li>
+      <li>A <a href="#1-5-x-reconfiguration-policy">Agent state recovery after resource changes</a></li>
     </ul>
   </td>
 
@@ -59,6 +60,7 @@ We categorize the changes as follows:
       <li>A <a href="#1-5-x-network-ports-isolator">container_ports_watch_interval</a></li>
       <li>A <a href="#1-5-x-network-ports-isolator">check_agent_port_range_only</a></li>
       <li>D <a href="#1-5-x-executor-secret-key">executor_secret_key</a></li>
+      <li>A <a href="#1-5-x-reconfiguration-policy">reconfiguration_policy</a></li>
     </ul>
   </td>
 
@@ -75,6 +77,7 @@ We categorize the changes as follows:
 
   <td style="word-wrap: break-word; overflow-wrap: break-word;"><!--Endpoints-->
     <ul style="padding-left:10px;">
+      <li>A <a href="#1-5-x-get-containers">Allowed to view nested/standalone containers</a></li>
     </ul>
   </td>
 
@@ -106,6 +109,7 @@ We categorize the changes as follows:
     <ul style="padding-left:10px;">
       <li>A <a href="#1-4-x-bounding-capabilities">Support for explicit setting bounding capabilities</a></li>
       <li>D <a href="#1-4-x-linuxinfo-capabilities">LinuxInfo.effective_capabilities deprecates LinuxInfo.capabilities</a></li>
+      <li>C <a href="#1-4-x-mesos-library">`Resources` class in the internal Mesos C++ library only supports post-`RESERVATION_REFINEMENT` format</a></li>
     </ul>
   </td>
 
@@ -387,6 +391,17 @@ We categorize the changes as follows:
 
 * The fields `Resource.disk.source.path.root` and `Resource.disk.source.mount.root` can now be set to relative paths to an agent's work directory. The containerizers will interpret the paths based on the `--work_dir` flag on an agent.
 
+<a name="1-5-x-get-containers"></a>
+
+* The agent operator API call `GET_CONTAINERS` has been updated to support listing nested or standalone containers. One can specify the following fields in the request:
+  * `show_nested`: Whether to show nested containers.
+  * `show_standalone`: Whether to show standalone containers.
+
+<a name="1-5-x-reconfiguration-policy"></a>
+* A new agent flag `--reconfiguration_policy` has been added. By setting the value of this flag to `additive`,
+  operators can allow the agent to be restarted with increased resources without requiring the agent ID to be
+  changed. Note that if this feature is used, the master version is required to be >= 1.5 as well.
+
 ## Upgrading from 1.3.x to 1.4.x ##
 
 <a name="1-4-x-ambient-capabilities"></a>
@@ -421,6 +436,10 @@ We categorize the changes as follows:
 <a name="1-4-x-xfs-no-enforce"></a>
 
 * The XFS Disk Isolator now supports the `--no-enforce_container_disk_quota` option to efficiently measure disk resource usage without enforcing any usage limits.
+
+<a name="1-4-x-mesos-library"></a>
+
+* The `Resources` class in the internal Mesos C++ library changed its behavior to only support post-`RESERVATION_REFINEMENT` format. If a framework is using this internal utility, it is likely to break if the `RESERVATION_REFINEMENT` capability is not enabled.
 
 ## Upgrading from 1.2.x to 1.3.x ##
 

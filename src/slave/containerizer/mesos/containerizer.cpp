@@ -660,9 +660,11 @@ Future<Nothing> MesosContainerizer::remove(const ContainerID& containerId)
 }
 
 
-Future<Nothing> MesosContainerizer::pruneImages()
+Future<Nothing> MesosContainerizer::pruneImages(
+    const vector<Image>& excludedImages)
 {
-  return dispatch(process.get(), &MesosContainerizerProcess::pruneImages);
+  return dispatch(
+      process.get(), &MesosContainerizerProcess::pruneImages, excludedImages);
 }
 
 
@@ -908,10 +910,15 @@ Future<Nothing> MesosContainerizerProcess::recover(
       !containerizer::paths::getContainerForceDestroyOnRecovery(
           flags.runtime_dir, containerId);
 
+    const bool isRecoverableStandaloneContainer =
+      isStandaloneContainer && pid.isSome();
+
     // Add recoverable nested containers or standalone containers
     // to the list of 'ContainerState'.
-    if (isRecoverableNestedContainer || isStandaloneContainer) {
-      CHECK_SOME(directory);
+    if (isRecoverableNestedContainer || isRecoverableStandaloneContainer) {
+      CHECK_SOME(container->directory);
+      CHECK_SOME(container->pid);
+
       ContainerState state =
         protobuf::slave::createContainerState(
             None(),
@@ -973,29 +980,28 @@ Future<list<Nothing>> MesosContainerizerProcess::recoverIsolators(
 
   // Then recover the isolators.
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // NOTE: We should not send nested containers to the isolator if
-    // the isolator does not support nesting.
-    if (isolator->supportsNesting()) {
-      futures.push_back(isolator->recover(recoverable, orphans));
-    } else {
-      // Strip nested containers from 'recoverable' and 'orphans'.
-      list<ContainerState> _recoverable;
-      hashset<ContainerID> _orphans;
+    list<ContainerState> _recoverable;
+    hashset<ContainerID> _orphans;
 
-      foreach (const ContainerState& state, recoverable) {
-        if (!state.container_id().has_parent()) {
-          _recoverable.push_back(state);
-        }
+    foreach (const ContainerState& state, recoverable) {
+      if (isSupportedByIsolator(
+              state.container_id(),
+              isolator->supportsNesting(),
+              isolator->supportsStandalone())) {
+        _recoverable.push_back(state);
       }
-
-      foreach (const ContainerID& orphan, orphans) {
-        if (!orphan.has_parent()) {
-          _orphans.insert(orphan);
-        }
-      }
-
-      futures.push_back(isolator->recover(_recoverable, _orphans));
     }
+
+    foreach (const ContainerID& orphan, orphans) {
+      if (isSupportedByIsolator(
+              orphan,
+              isolator->supportsNesting(),
+              isolator->supportsStandalone())) {
+        _orphans.insert(orphan);
+      }
+    }
+
+    futures.push_back(isolator->recover(_recoverable, _orphans));
   }
 
   // If all isolators recover then continue.
@@ -1047,9 +1053,10 @@ Future<Nothing> MesosContainerizerProcess::__recover(
     const ContainerID& containerId = run.container_id();
 
     foreach (const Owned<Isolator>& isolator, isolators) {
-      // If this is a nested container, we need to skip isolators that
-      // do not support nesting.
-      if (containerId.has_parent() && !isolator->supportsNesting()) {
+      if (!isSupportedByIsolator(
+              containerId,
+              isolator->supportsNesting(),
+              isolator->supportsStandalone())) {
         continue;
       }
 
@@ -1162,8 +1169,9 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
 
 #ifndef __WINDOWS__
     if (containerConfig.has_user()) {
-      LOG(INFO) << "Trying to chown '" << directory << "' to user '"
-                << containerConfig.user() << "'";
+      LOG_BASED_ON_CLASS(containerConfig.container_class())
+        << "Trying to chown '" << directory << "' to user '"
+        << containerConfig.user() << "'";
 
       Try<Nothing> chown = os::chown(containerConfig.user(), directory);
       if (chown.isError()) {
@@ -1196,7 +1204,8 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
     }
   }
 
-  LOG(INFO) << "Starting container " << containerId;
+  LOG_BASED_ON_CLASS(containerConfig.container_class())
+    << "Starting container " << containerId;
 
   // Before we launch the container, we first create the container
   // runtime directory to hold internal checkpoint information about
@@ -1379,9 +1388,10 @@ Future<Nothing> MesosContainerizerProcess::prepare(
     list<Option<ContainerLaunchInfo>>();
 
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // If this is a nested container, we need to skip isolators that
-    // do not support nesting.
-    if (containerId.has_parent() && !isolator->supportsNesting()) {
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
       continue;
     }
 
@@ -1632,8 +1642,7 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
   Environment containerEnvironment;
 
   // Inherit environment from the parent container for DEBUG containers.
-  if (container->config->has_container_class() &&
-      container->config->container_class() == ContainerClass::DEBUG) {
+  if (container->containerClass() == ContainerClass::DEBUG) {
     // DEBUG containers must have a parent.
     CHECK(containerId.has_parent());
     if (containers_[containerId.parent()]->launchInfo.isSome()) {
@@ -1650,8 +1659,7 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
   }
 
   // DEBUG containers inherit MESOS_SANDBOX from their parent.
-  if (!container->config->has_container_class() ||
-      container->config->container_class() != ContainerClass::DEBUG) {
+  if (container->containerClass() == ContainerClass::DEFAULT) {
     // TODO(jieyu): Consider moving this to filesystem isolator.
     //
     // NOTE: For the command executor case, although it uses the host
@@ -1703,15 +1711,23 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
   //
   // TODO(alexr): Determining working directory is a convoluted process. We
   // should either simplify the logic or extract it into a helper routine.
-  if (container->config->has_container_class() &&
-      container->config->container_class() == ContainerClass::DEBUG) {
+  if (container->containerClass() == ContainerClass::DEBUG) {
     // DEBUG containers must have a parent.
     CHECK(containerId.has_parent());
 
     if (containers_[containerId.parent()]->launchInfo.isSome()) {
       // TODO(alexr): Remove this once we no longer support executorless
       // command tasks in favor of default executor.
-      if (containers_[containerId.parent()]->config->has_task_info()) {
+      //
+      // The `ContainerConfig` may not exist for the parent container.
+      // The check is necessary because before MESOS-6894, containers
+      // do not have `ContainerConfig` checkpointed. For the upgrade
+      // scenario, if any nested container is launched under an existing
+      // legacy container, the agent would fail due to an unguarded access
+      // to the parent legacy container's ContainerConfig. We need to add
+      // this check. Please see MESOS-8325 for details.
+      if (containers_[containerId.parent()]->config.isSome() &&
+          containers_[containerId.parent()]->config->has_task_info()) {
         // For the command executor case, even if the task itself has a root
         // filesystem, the executor container still uses the host filesystem,
         // hence `ContainerLaunchInfo.working_directory`, which points to the
@@ -1929,8 +1945,9 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
 
   // Checkpoint the forked pid if requested by the agent.
   if (pidCheckpointPath.isSome()) {
-    LOG(INFO) << "Checkpointing container's forked pid " << pid
-              << " to '" << pidCheckpointPath.get() << "'";
+    LOG_BASED_ON_CLASS(container->containerClass())
+      << "Checkpointing container's forked pid " << pid
+      << " to '" << pidCheckpointPath.get() << "'";
 
     Try<Nothing> checkpointed =
       slave::state::checkpoint(pidCheckpointPath.get(), stringify(pid));
@@ -2001,9 +2018,10 @@ Future<Nothing> MesosContainerizerProcess::isolate(
 
   // Set up callbacks for isolator limitations.
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // If this is a nested container, we need to skip isolators that
-    // do not support nesting.
-    if (containerId.has_parent() && !isolator->supportsNesting()) {
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
       continue;
     }
 
@@ -2017,9 +2035,10 @@ Future<Nothing> MesosContainerizerProcess::isolate(
   // isolation.
   list<Future<Nothing>> futures;
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // If this is a nested container, we need to skip isolators that
-    // do not support nesting.
-    if (containerId.has_parent() && !isolator->supportsNesting()) {
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
       continue;
     }
 
@@ -2151,8 +2170,13 @@ Future<Nothing> MesosContainerizerProcess::update(
   // Update each isolator.
   list<Future<Nothing>> futures;
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // NOTE: No need to skip non-nesting aware isolator here because
-    // 'update' currently will not be called for nested container.
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
+      continue;
+    }
+
     futures.push_back(isolator->update(containerId, resources));
   }
 
@@ -2170,8 +2194,6 @@ Future<ResourceStatistics> _usage(
     const Option<Resources>& resources,
     const list<Future<ResourceStatistics>>& statistics)
 {
-  CHECK(!containerId.has_parent());
-
   ResourceStatistics result;
 
   // Set the timestamp now we have all statistics.
@@ -2208,16 +2230,19 @@ Future<ResourceStatistics> _usage(
 Future<ResourceStatistics> MesosContainerizerProcess::usage(
     const ContainerID& containerId)
 {
-  CHECK(!containerId.has_parent());
-
   if (!containers_.contains(containerId)) {
     return Failure("Unknown container " + stringify(containerId));
   }
 
   list<Future<ResourceStatistics>> futures;
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // NOTE: No need to skip non-nesting aware isolator here because
-    // 'update' currently will not be called for nested container.
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
+      continue;
+    }
+
     futures.push_back(isolator->usage(containerId));
   }
 
@@ -2242,9 +2267,10 @@ Future<ContainerStatus> MesosContainerizerProcess::status(
 
   list<Future<ContainerStatus>> futures;
   foreach (const Owned<Isolator>& isolator, isolators) {
-    // If this is a nested container, we need to skip isolators that
-    // do not support nesting.
-    if (containerId.has_parent() && !isolator->supportsNesting()) {
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
       continue;
     }
 
@@ -2323,8 +2349,9 @@ Future<bool> MesosContainerizerProcess::destroy(
       .then([]() { return true; });
   }
 
-  LOG(INFO) << "Destroying container " << containerId << " in "
-            << container->state << " state";
+  LOG_BASED_ON_CLASS(container->containerClass())
+    << "Destroying container " << containerId << " in "
+    << container->state << " state";
 
   // NOTE: We save the previous state so that '_destroy' can properly
   // cleanup based on the previous state of the container.
@@ -2612,8 +2639,9 @@ void MesosContainerizerProcess::______destroy(
     const string terminationPath =
       path::join(runtimePath, containerizer::paths::TERMINATION_FILE);
 
-    LOG(INFO) << "Checkpointing termination state to nested container's"
-              << " runtime directory '" << terminationPath << "'";
+    LOG_BASED_ON_CLASS(container->containerClass())
+      << "Checkpointing termination state to nested container's runtime"
+      << " directory '" << terminationPath << "'";
 
     Try<Nothing> checkpointed =
       slave::state::checkpoint(terminationPath, termination);
@@ -2774,7 +2802,8 @@ void MesosContainerizerProcess::reaped(const ContainerID& containerId)
     return;
   }
 
-  LOG(INFO) << "Container " << containerId << " has exited";
+  LOG_BASED_ON_CLASS(containers_.at(containerId)->containerClass())
+    << "Container " << containerId << " has exited";
 
   // The executor has exited so destroy the container.
   destroy(containerId, None());
@@ -2793,9 +2822,9 @@ void MesosContainerizerProcess::limited(
   Option<ContainerTermination> termination = None();
 
   if (future.isReady()) {
-    LOG(INFO) << "Container " << containerId << " has reached its limit for"
-              << " resource " << future.get().resources()
-              << " and will be terminated";
+    LOG_BASED_ON_CLASS(containers_.at(containerId)->containerClass())
+      << "Container " << containerId << " has reached its limit for resource "
+      << future.get().resources() << " and will be terminated";
 
     termination = ContainerTermination();
     termination->set_state(TaskState::TASK_FAILED);
@@ -2828,10 +2857,11 @@ Future<hashset<ContainerID>> MesosContainerizerProcess::containers()
 }
 
 
-Future<Nothing> MesosContainerizerProcess::pruneImages()
+Future<Nothing> MesosContainerizerProcess::pruneImages(
+    const vector<Image>& excludedImages)
 {
-  vector<Image> excludedImages;
-  excludedImages.reserve(containers_.size());
+  vector<Image> _excludedImages;
+  _excludedImages.reserve(containers_.size() + excludedImages.size());
 
   foreachpair (
       const ContainerID& containerId,
@@ -2850,14 +2880,26 @@ Future<Nothing> MesosContainerizerProcess::pruneImages()
     const ContainerConfig& containerConfig = container->config.get();
     if (containerConfig.has_container_info() &&
         containerConfig.container_info().mesos().has_image()) {
-      excludedImages.push_back(
+      _excludedImages.push_back(
           containerConfig.container_info().mesos().image());
     }
   }
 
-  // TODO(zhitao): use std::unique to deduplicate `excludedImages`.
+  foreach (const Image& image, excludedImages) {
+    _excludedImages.push_back(image);
+  }
 
-  return provisioner->pruneImages(excludedImages);
+  // TODO(zhitao): use std::unique to deduplicate `_excludedImages`.
+
+  return provisioner->pruneImages(_excludedImages);
+}
+
+
+ContainerClass MesosContainerizerProcess::Container::containerClass()
+{
+  return (config.isSome() && config->has_container_class())
+      ? config->container_class()
+      : ContainerClass::DEFAULT;
 }
 
 
@@ -2883,9 +2925,10 @@ Future<list<Future<Nothing>>> MesosContainerizerProcess::cleanupIsolators(
   // NOTE: We clean up each isolator in the reverse order they were
   // prepared (see comment in prepare()).
   foreach (const Owned<Isolator>& isolator, adaptor::reverse(isolators)) {
-    // If this is a nested container, we need to skip isolators that
-    // do not support nesting.
-    if (containerId.has_parent() && !isolator->supportsNesting()) {
+    if (!isSupportedByIsolator(
+            containerId,
+            isolator->supportsNesting(),
+            isolator->supportsStandalone())) {
       continue;
     }
 
@@ -2920,10 +2963,42 @@ void MesosContainerizerProcess::transition(
 
   const Owned<Container>& container = containers_.at(containerId);
 
-  LOG(INFO) << "Transitioning the state of container " << containerId
-            << " from " << container->state << " to " << state;
+  LOG_BASED_ON_CLASS(container->containerClass())
+    << "Transitioning the state of container " << containerId << " from "
+    << container->state << " to " << state;
 
   container->state = state;
+}
+
+
+bool MesosContainerizerProcess::isSupportedByIsolator(
+    const ContainerID& containerId,
+    bool isolatorSupportsNesting,
+    bool isolatorSupportsStandalone)
+{
+  if (!isolatorSupportsNesting) {
+    if (containerId.has_parent()) {
+      return false;
+    }
+  }
+
+  if (!isolatorSupportsStandalone) {
+    // NOTE: If standalone container is not supported, the nested
+    // containers of the standalone container won't be supported
+    // neither.
+    ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
+
+    bool isStandaloneContainer =
+      containerizer::paths::isStandaloneContainer(
+          flags.runtime_dir,
+          rootContainerId);
+
+    if (isStandaloneContainer) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 

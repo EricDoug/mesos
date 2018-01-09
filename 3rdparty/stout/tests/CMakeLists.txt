@@ -51,6 +51,7 @@ set(STOUT_ROOT_TESTS_SRC
   strings_tests.cpp
   subcommand_tests.cpp
   try_tests.cpp
+  uri_tests.cpp
   uuid_tests.cpp
   variant_tests.cpp
   version_tests.cpp)
@@ -63,18 +64,19 @@ if (NOT WIN32)
 endif ()
 
 set(STOUT_OS_TESTS_SRC
+  os/copyfile_tests.cpp
   os/env_tests.cpp
   os/filesystem_tests.cpp
   os/process_tests.cpp
   os/rmdir_tests.cpp
   os/socket_tests.cpp
-  os/strerror_tests.cpp
-  os/systems_tests.cpp)
+  os/strerror_tests.cpp)
 
 if (NOT WIN32)
   list(APPEND STOUT_OS_TESTS_SRC
     os/sendfile_tests.cpp
-    os/signals_tests.cpp)
+    os/signals_tests.cpp
+    os/systems_tests.cpp)
 endif ()
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")

@@ -3169,6 +3169,11 @@ Content-Type: application/json
 This call retrieves information about containers running on this agent. It contains
 ContainerStatus and ResourceStatistics along with some metadata of the containers.
 
+There are two knobs in the request to control the types of the containers this
+API will return:
+* `show_nested`: Whether to show nested containers [default: false].
+* `show_standalone`: Whether to show standalone containers [default: false].
+
 ```
 GET_CONTAINERS HTTP Request (JSON):
 
@@ -3179,7 +3184,11 @@ Content-Type: application/json
 Accept: application/json
 
 {
-  "type": "GET_CONTAINERS"
+  "type": "GET_CONTAINERS",
+  "get_containers": {
+    "show_nested": true,
+    "show_standalone": false
+  }
 }
 
 
@@ -3836,6 +3845,36 @@ Accept: application/json
 }
 
 REMOVE_NESTED_CONTAINER HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### PRUNE_IMAGES
+
+This call triggers garbage collection for container images. This call can
+only be made when all running containers are launched with Mesos version 1.5
+or newer. An optional list of excluded images from GC can be speficied via
+`prune_images.excluded_images` field.
+
+```
+PRUNE_IMAGES HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: agenthost:5051
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "PRUNE_IMAGES",
+  "prune_images": {
+    "excluded_images": [
+      {"type":"DOCKER","docker":{"name":"mysql:latest"}}
+    ]
+  }
+}
+
+PRUNE_IMAGES HTTP Response (JSON):
 
 HTTP/1.1 200 OK
 ```

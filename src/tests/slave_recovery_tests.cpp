@@ -138,7 +138,7 @@ TEST_F(SlaveStateTest, CheckpointProtobufMessage)
 TEST_F(SlaveStateTest, CheckpointRepeatedProtobufMessages)
 {
   // Checkpoint resources.
-  const google::protobuf::RepeatedPtrField<Resource> expected =
+  const Resources expected =
     Resources::parse("cpus:2;mem:512;cpus(role):4;mem(role):1024").get();
 
   const string file = "resources-file";
@@ -148,6 +148,11 @@ TEST_F(SlaveStateTest, CheckpointRepeatedProtobufMessages)
     ::protobuf::read<RepeatedPtrField<Resource>>(file);
 
   ASSERT_SOME(actual);
+
+  // We convert the `actual` back to "post-reservation-refinement"
+  // since `state::checkpoint` always downgrades whatever resources
+  // are downgradable.
+  convertResourceFormat(&actual.get(), POST_RESERVATION_REFINEMENT);
 
   EXPECT_SOME_EQ(expected, actual);
 }
@@ -334,7 +339,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
         .tasks[task.task_id()]
         .updates.front().uuid());
 
-  const UUID uuid = UUID::fromBytes(ack->acknowledge().uuid()).get();
+  const id::UUID uuid = id::UUID::fromBytes(ack->acknowledge().uuid()).get();
   ASSERT_TRUE(state
                 .frameworks[frameworkId]
                 .executors[executorId]
@@ -763,7 +768,13 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
-  // Drop the first update from the executor.
+  // Drop the status updates from the executor.
+  // We actually wait until we can drop the TASK_RUNNING update here
+  // because the window between the two is small enough that we could
+  // still successfully receive TASK_RUNNING after we drop TASK_STARTING.
+  Future<StatusUpdateMessage> runningUpdate =
+    DROP_PROTOBUF(StatusUpdateMessage(), _, _);
+
   Future<StatusUpdateMessage> startingUpdate =
     DROP_PROTOBUF(StatusUpdateMessage(), _, _);
 
@@ -771,6 +782,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
 
   // Stop the slave before the status update is received.
   AWAIT_READY(startingUpdate);
+  AWAIT_READY(runningUpdate);
 
   slave.get()->terminate();
 
@@ -4046,7 +4058,9 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 TYPED_TEST(SlaveRecoveryTest, MasterFailover)
 {
   // Step 1. Run a task.
-  Try<Owned<cluster::Master>> master = this->StartMaster();
+  master::Flags masterFlags = this->CreateMasterFlags();
+  masterFlags.registry = "replicated_log";
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
@@ -4110,7 +4124,7 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
   EXPECT_CALL(sched, disconnected(&driver));
 
   master->reset();
-  master = this->StartMaster();
+  master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   Future<Nothing> registered;
@@ -4559,6 +4573,7 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
 
   Try<Owned<cluster::Slave>> slave =
     this->StartSlave(detector.get(), &containerizer1, flags);
+
   ASSERT_SOME(slave);
 
   // Enable checkpointing for the framework.
@@ -4634,6 +4649,347 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
 
   driver.stop();
   driver.join();
+}
+
+
+// This test starts a task, restarts the slave with increased
+// resources while the task is still running, and then stops
+// the task, verifying that all resources are seen in subsequent
+// offers.
+TYPED_TEST(SlaveRecoveryTest, AgentReconfigurationWithRunningTask)
+{
+  // Start a master.
+  Try<Owned<cluster::Master>> master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  // Start a framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Start a slave.
+  slave::Flags flags = this->CreateSlaveFlags();
+  flags.resources = "cpus:5;mem:0;disk:0;ports:0";
+
+  Fetcher fetcher(flags);
+
+  Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), flags);
+
+  ASSERT_SOME(slave);
+
+  // Start a long-running task on the slave.
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  EXPECT_EQ(
+      offers1.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:5").get(), "*"));
+
+  SlaveID slaveId = offers1.get()[0].slave_id();
+  TaskInfo task = createTask(
+      slaveId, Resources::parse("cpus:3").get(), "sleep 1000");
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusKilled;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusKilled));
+
+  driver.launchTasks(offers1.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  AWAIT_READY(statusRunning);
+
+  // Grab one of the offers while the task is running.
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  EXPECT_EQ(
+      offers2.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:2").get(), "*"));
+
+  driver.declineOffer(offers2.get()[0].id());
+
+  // Restart the slave with increased resources.
+  slave.get()->terminate();
+  flags.reconfiguration_policy = "additive";
+  flags.resources = "cpus:10;mem:512;disk:0;ports:0";
+
+  // Restart the slave with a new containerizer.
+  _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  Future<SlaveReregisteredMessage> slaveReregistered =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+
+  // Grab one of the offers after the slave was restarted.
+  Future<vector<Offer>> offers3;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers3))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+  AWAIT_READY(slaveReregistered);
+
+  AWAIT_READY(offers3);
+  EXPECT_EQ(
+      offers3.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:7;mem:512").get(), "*"));
+
+  // Decline so we get the resources offered again with the next offer.
+  driver.declineOffer(offers3.get()[0].id());
+
+  // Kill the task
+  driver.killTask(task.task_id());
+  AWAIT_READY(statusKilled);
+  ASSERT_EQ(TASK_KILLED, statusKilled->state());
+
+  // Grab one of the offers after the task was killed.
+  Future<vector<Offer>> offers4;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers4))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_EQ(
+      offers4.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:10;mem:512").get(), "*"));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that checkpointed resources sent by a non resource
+// provider-capable agent during agent reregistration are ignored by
+// the master and that the master reattempts the checkpointing.
+TYPED_TEST(SlaveRecoveryTest, CheckpointedResources)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+
+  slave::Flags slaveFlags = this->CreateSlaveFlags();
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = this->StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger the agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "foo");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  // Below we send a reserve operation which is applied in the master
+  // speculatively. We drop the operation on its way to the agent so
+  // that the master's and the agent's view of the agent's
+  // checkpointed resources diverge.
+  Future<CheckpointResourcesMessage> checkpointResourcesMessage =
+    DROP_PROTOBUF(CheckpointResourcesMessage(), _, _);
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  const Offer& offer1 = offers1->at(0);
+
+  const Resources offeredResources = offer1.resources();
+  const Resources dynamicallyReserved =
+    offeredResources.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  driver.acceptOffers({offer1.id()}, {RESERVE(dynamicallyReserved)}, filters);
+
+  AWAIT_READY(checkpointResourcesMessage);
+
+  // Restart and reregister the agent.
+  slave.get()->terminate();
+
+  slave = this->StartSlave(&detector, slaveFlags);
+
+  // Advance the clock to trigger an agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  const Offer& offer2 = offers2->at(0);
+
+  // The second offer will be identical to the first
+  // one as our operations never made it to the agent.
+  const Resources offeredResources2 = offer2.resources();
+
+  EXPECT_EQ(dynamicallyReserved, offeredResources2);
+}
+
+
+// This test verifies that checkpointed resources sent by resource
+// provider-capable agents during agent reregistration overwrite the
+// master's view of that agent's checkpointed resources.
+TYPED_TEST(SlaveRecoveryTest, CheckpointedResourcesResourceProviderCapable)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+
+  slave::Flags slaveFlags = this->CreateSlaveFlags();
+
+  // Set the resource provider capability.
+  vector<SlaveInfo::Capability> capabilities = slave::AGENT_CAPABILITIES();
+  SlaveInfo::Capability capability;
+  capability.set_type(SlaveInfo::Capability::RESOURCE_PROVIDER);
+  capabilities.push_back(capability);
+
+  slaveFlags.agent_features = SlaveCapabilities();
+  slaveFlags.agent_features->mutable_capabilities()->CopyFrom(
+      {capabilities.begin(), capabilities.end()});
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = this->StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger the agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "foo");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  // Below we send a reserve operation which is applied in the master
+  // speculatively. We drop the operation on its way to the agent so
+  // that the master's and the agent's view of the agent's
+  // checkpointed resources diverge.
+  Future<ApplyOperationMessage> applyOperationMessage =
+    DROP_PROTOBUF(ApplyOperationMessage(), _, _);
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  const Offer& offer1 = offers1->at(0);
+
+  const Resources offeredResources = offer1.resources();
+  const Resources dynamicallyReserved =
+    offeredResources.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  driver.acceptOffers({offer1.id()}, {RESERVE(dynamicallyReserved)}, filters);
+
+  AWAIT_READY(applyOperationMessage);
+
+  // Restart and reregister the agent.
+  slave.get()->terminate();
+  slave = this->StartSlave(&detector, slaveFlags);
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Advance the clock to trigger an agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  // Advance the clock to trigger a batch allocation.
+  AWAIT_READY(updateSlaveMessage);
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  const Offer& offer2 = offers2->at(0);
+
+  // The second offer will be identical to the first
+  // one as our operations never made it to the agent.
+  const Resources offeredResources1 = offer1.resources();
+  const Resources offeredResources2 = offer2.resources();
+
+  EXPECT_EQ(offeredResources1, offeredResources2);
 }
 
 

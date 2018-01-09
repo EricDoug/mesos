@@ -65,6 +65,7 @@ const char TASK_UPDATES_FILE[] = "task.updates";
 const char RESOURCES_INFO_FILE[] = "resources.info";
 const char RESOURCES_TARGET_FILE[] = "resources.target";
 const char RESOURCE_PROVIDER_STATE_FILE[] = "resource_provider.state";
+const char OPERATION_UPDATES_FILE[] = "operation.updates";
 
 
 const char CONTAINERS_DIR[] = "containers";
@@ -75,6 +76,7 @@ const char EXECUTORS_DIR[] = "executors";
 const char EXECUTOR_RUNS_DIR[] = "runs";
 const char RESOURCE_PROVIDER_REGISTRY[] = "resource_provider_registry";
 const char RESOURCE_PROVIDERS_DIR[] = "resource_providers";
+const char OPERATIONS_DIR[] = "operations";
 
 
 Try<ExecutorRunPath> parseExecutorRunPath(
@@ -542,6 +544,58 @@ string getLatestResourceProviderPath(
       resourceProviderType,
       resourceProviderName,
       LATEST_SYMLINK);
+}
+
+
+Try<list<string>> getOperationPaths(
+    const string& rootDir)
+{
+  return fs::list(path::join(rootDir, OPERATIONS_DIR, "*"));
+}
+
+
+string getOperationPath(
+    const string& rootDir,
+    const id::UUID& operationUuid)
+{
+  return path::join(rootDir, OPERATIONS_DIR, operationUuid.toString());
+}
+
+
+Try<id::UUID> parseOperationPath(
+    const string& rootDir,
+    const string& dir)
+{
+  // TODO(chhsiao): Consider using `<regex>`, which requires GCC 4.9+.
+
+  // Make sure there's a separator at the end of the prefix so that we
+  // don't accidently slice off part of a directory.
+  const string prefix = path::join(rootDir, OPERATIONS_DIR, "");
+
+  if (!strings::startsWith(dir, prefix)) {
+    return Error(
+        "Directory '" + dir + "' does not fall under operations directory '" +
+        prefix + "'");
+  }
+
+  Try<id::UUID> operationUuid = id::UUID::fromString(Path(dir).basename());
+  if (operationUuid.isError()) {
+    return Error(
+        "Could not decode operation UUID from string '" +
+        Path(dir).basename() + "': " + operationUuid.error());
+  }
+
+  return operationUuid.get();
+}
+
+
+string getOperationUpdatesPath(
+    const string& rootDir,
+    const id::UUID& operationUuid)
+{
+  return path::join(
+      getOperationPath(rootDir, operationUuid),
+      OPERATION_UPDATES_FILE);
 }
 
 
